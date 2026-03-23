@@ -11,7 +11,7 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 import gc
 import math
 import time
-from dataclasses import dataclass, asdict, replace
+from dataclasses import dataclass, asdict, field
 
 import torch
 import torch.nn as nn
@@ -35,15 +35,23 @@ from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evalua
 # ---------------------------------------------------------------------------
 
 @dataclass
-class GPTConfig:
-    sequence_len: int = 2048
-    vocab_size: int = 32768
-    n_layer: int = 12
+class BlockConfig:
     n_head: int = 6
     n_kv_head: int = 6
     n_embd: int = 768
-    window_pattern: str = "SSSL"
     has_ve: bool = False
+    window_size: tuple = (-1, 0)  # (-1, 0) = full context; (k, 0) = sliding window
+
+
+@dataclass
+class GPTConfig:
+    sequence_len: int = 2048
+    vocab_size: int = 32768
+    blocks: list = field(default_factory=list)  # list of (count, BlockConfig)
+
+    @property
+    def n_layer(self):
+        return sum(count for count, _ in self.blocks)
 
 
 def norm(x):
@@ -127,23 +135,22 @@ class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.window_sizes = self._compute_window_sizes(config)
+        self.block_configs = [bc for count, bc in config.blocks for _ in range(count)]
+        self.window_sizes = [bc.window_size for bc in self.block_configs]
+        bc0 = self.block_configs[0]
+        head_dim = bc0.n_embd // bc0.n_head
+        kv_dim = bc0.n_kv_head * head_dim
         self.transformer = nn.ModuleDict({
-            "wte": nn.Embedding(config.vocab_size, config.n_embd),
-            "h": nn.ModuleList([
-                Block(replace(config, has_ve=(i % 2 == (config.n_layer - 1) % 2)))
-                for i in range(config.n_layer)
-            ]),
+            "wte": nn.Embedding(config.vocab_size, bc0.n_embd),
+            "h": nn.ModuleList([Block(bc) for bc in self.block_configs]),
         })
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(bc0.n_embd, config.vocab_size, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
         # Value embeddings
-        head_dim = config.n_embd // config.n_head
-        kv_dim = config.n_kv_head * head_dim
         self.value_embeds = nn.ModuleDict({
             str(i): nn.Embedding(config.vocab_size, kv_dim)
-            for i in range(config.n_layer) if i % 2 == (config.n_layer - 1) % 2
+            for i, bc in enumerate(self.block_configs) if bc.has_ve
         })
         # Rotary embeddings
         self.rotary_seq_len = config.sequence_len * 10
@@ -157,7 +164,7 @@ class GPT(nn.Module):
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
         # Transformer blocks
-        n_embd = self.config.n_embd
+        n_embd = self.block_configs[0].n_embd
         s = 3**0.5 * n_embd**-0.5
         for block in self.transformer.h:
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
@@ -177,7 +184,8 @@ class GPT(nn.Module):
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
         # Rotary embeddings
-        head_dim = self.config.n_embd // self.config.n_head
+        bc0 = self.block_configs[0]
+        head_dim = bc0.n_embd // bc0.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
         # Cast embeddings to bf16
@@ -197,30 +205,17 @@ class GPT(nn.Module):
         cos, sin = cos[None, :, None, :], sin[None, :, None, :]
         return cos, sin
 
-    def _compute_window_sizes(self, config):
-        pattern = config.window_pattern.upper()
-        assert all(c in "SL" for c in pattern)
-        long_window = config.sequence_len
-        short_window = long_window // 2
-        char_to_window = {"L": (long_window, 0), "S": (short_window, 0)}
-        window_sizes = []
-        for layer_idx in range(config.n_layer):
-            char = pattern[layer_idx % len(pattern)]
-            window_sizes.append(char_to_window[char])
-        window_sizes[-1] = (long_window, 0)
-        return window_sizes
-
     def estimate_flops(self):
         """Estimated FLOPs per token (forward + backward)."""
         nparams = sum(p.numel() for p in self.parameters())
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel())
-        h = self.config.n_head
-        q = self.config.n_embd // self.config.n_head
         t = self.config.sequence_len
         attn_flops = 0
-        for window_size in self.window_sizes:
+        for bc, window_size in zip(self.block_configs, self.window_sizes):
+            h = bc.n_head
+            q = bc.n_embd // bc.n_head
             window = window_size[0]
             effective_seq = t if window < 0 else min(window, t)
             attn_flops += 12 * h * q * effective_seq
@@ -240,7 +235,7 @@ class GPT(nn.Module):
 
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
                         weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
-        model_dim = self.config.n_embd
+        model_dim = self.block_configs[0].n_embd
         matrix_params = list(self.transformer.h.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
@@ -475,10 +470,23 @@ def build_model_config(depth):
     base_dim = depth * ASPECT_RATIO
     model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
     num_heads = model_dim // HEAD_DIM
+    long_window = MAX_SEQ_LEN
+    short_window = long_window // 2
+    pattern = WINDOW_PATTERN.upper()
+    block_configs = []
+    for i in range(depth):
+        char = pattern[i % len(pattern)]
+        window_size = (long_window, 0) if char == "L" else (short_window, 0)
+        if i == depth - 1:
+            window_size = (long_window, 0)  # last layer always full context
+        has_ve = i % 2 == (depth - 1) % 2
+        block_configs.append(BlockConfig(
+            n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
+            has_ve=has_ve, window_size=window_size,
+        ))
     return GPTConfig(
         sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-        window_pattern=WINDOW_PATTERN,
+        blocks=[(1, bc) for bc in block_configs],
     )
 
 config = build_model_config(DEPTH)
