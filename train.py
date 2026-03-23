@@ -46,7 +46,7 @@ class GPTConfig:
 
     @property
     def n_layer(self):
-        return sum(count for count, _ in self.blocks)
+        return len(self.blocks)
 
 
 def norm(x):
@@ -129,7 +129,7 @@ class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.block_configs = [bc for count, bc in config.blocks for _ in range(count)]
+        self.block_configs = list(config.blocks)
         self.window_sizes = [bc.window_size for bc in self.block_configs]
         bc0 = self.block_configs[0]
         head_dim = bc0.n_embd // bc0.n_head
@@ -423,11 +423,6 @@ class MuonAdamW(torch.optim.Optimizer):
 # Hyperparameters (edit these directly, no CLI flags needed)
 # ---------------------------------------------------------------------------
 
-# Model architecture
-ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
-HEAD_DIM = 128          # target head dimension for attention
-WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
-
 # Optimization
 TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
 EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
@@ -440,8 +435,6 @@ WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
-# Model size
-DEPTH = 8               # number of transformer layers
 DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
 # ---------------------------------------------------------------------------
@@ -460,30 +453,15 @@ tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
 print(f"Vocab size: {vocab_size:,}")
 
-def build_model_config(depth):
-    base_dim = depth * ASPECT_RATIO
-    model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
-    num_heads = model_dim // HEAD_DIM
-    long_window = MAX_SEQ_LEN
-    short_window = long_window // 2
-    pattern = WINDOW_PATTERN.upper()
-    block_configs = []
-    for i in range(depth):
-        char = pattern[i % len(pattern)]
-        window_size = (long_window, 0) if char == "L" else (short_window, 0)
-        if i == depth - 1:
-            window_size = (long_window, 0)  # last layer always full context
-        has_ve = i % 2 == (depth - 1) % 2
-        block_configs.append(BlockConfig(
-            n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-            has_ve=has_ve, window_size=window_size,
-        ))
-    return GPTConfig(
-        sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
-        blocks=[(1, bc) for bc in block_configs],
-    )
+S   = BlockConfig(n_head=4, n_kv_head=4, n_embd=512, has_ve=False, window_size=(1024, 0))
+SVE = BlockConfig(n_head=4, n_kv_head=4, n_embd=512, has_ve=True,  window_size=(1024, 0))
+LVE = BlockConfig(n_head=4, n_kv_head=4, n_embd=512, has_ve=True,  window_size=(2048, 0))
 
-config = build_model_config(DEPTH)
+config = GPTConfig(
+    sequence_len=MAX_SEQ_LEN,
+    vocab_size=vocab_size,
+    blocks=[S, SVE, S, LVE, S, SVE, S, LVE],
+)
 print(f"Model config: {asdict(config)}")
 
 with torch.device("meta"):
@@ -634,4 +612,4 @@ print(f"mfu_percent:      {steady_state_mfu:.2f}")
 print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
-print(f"depth:            {DEPTH}")
+print(f"depth:            {config.n_layer}")
