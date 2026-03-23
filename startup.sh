@@ -1,12 +1,12 @@
 #!/bin/bash
 # =============================================================================
-# startup.sh — Lives in the repo at /working/autoresearch/startup.sh
+# startup.sh — Lives in the repo at /workspace/autoresearch/startup.sh
 # Called by entrypoint.sh after clone/pull.
 # =============================================================================
 set -euo pipefail
 
 REPO_NAME="${REPO_NAME:-autoresearch}"
-REPO_DIR="/working/$REPO_NAME"
+REPO_DIR="/workspace/$REPO_NAME"
 ENV_FILE="$REPO_DIR/.env"
 BASHRC="/root/.bashrc"
 
@@ -25,7 +25,7 @@ fi
 # -----------------------------------------------------------------------------
 # 2. Patch .bashrc so .env and UV_PROJECT_ENVIRONMENT are set in every shell
 # -----------------------------------------------------------------------------
-BASHRC_MARKER="# cloud-gpu: auto-source project .env"
+BASHRC_MARKER="# cloud: auto-source project .env"
 if ! grep -qF "$BASHRC_MARKER" "$BASHRC" 2>/dev/null; then
     echo "[startup] Patching $BASHRC"
     cat >> "$BASHRC" << BASHEOF
@@ -48,7 +48,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader \
 # -----------------------------------------------------------------------------
 # 4. Volume / disk check
 # -----------------------------------------------------------------------------
-for vol in /working /data /scratch; do
+for vol in /workspace /data /scratch; do
     if [ -d "$vol" ]; then
         echo "[startup] $vol: $(df -h "$vol" | tail -1 | awk '{print $4}') free"
     else
