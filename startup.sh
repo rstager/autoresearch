@@ -1,12 +1,12 @@
 #!/bin/bash
 # =============================================================================
-# startup.sh — Lives in the repo at /working/autoresearch/startup.sh
+# startup.sh — Lives in the repo at /workspace/autoresearch/startup.sh
 # Called by entrypoint.sh after clone/pull.
 # =============================================================================
 set -euo pipefail
 
 REPO_NAME="${REPO_NAME:-autoresearch}"
-REPO_DIR="/working/$REPO_NAME"
+REPO_DIR="/workspace/$REPO_NAME"
 ENV_FILE="$REPO_DIR/.env"
 BASHRC="/root/.bashrc"
 
@@ -48,7 +48,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader \
 # -----------------------------------------------------------------------------
 # 4. Volume / disk check
 # -----------------------------------------------------------------------------
-for vol in /working /data /scratch; do
+for vol in /workspace /data /scratch; do
     if [ -d "$vol" ]; then
         echo "[startup] $vol: $(df -h "$vol" | tail -1 | awk '{print $4}') free"
     else
@@ -71,7 +71,14 @@ export TMPDIR="${TMPDIR:-/scratch/tmp}"
 export PYTHONPATH="${PYTHONPATH:-$REPO_DIR}"
 
 # -----------------------------------------------------------------------------
-# 7. DATA SETUP — download data if not already present
+# 7. Install Python dependencies
+# -----------------------------------------------------------------------------
+echo "[startup] Installing Python dependencies..."
+cd "$REPO_DIR"
+uv sync --frozen
+
+# -----------------------------------------------------------------------------
+# 8. DATA SETUP — download data if not already present
 # -----------------------------------------------------------------------------
 DATA_READY_FLAG="/data/datasets/.ready"
 if [ ! -f "$DATA_READY_FLAG" ]; then
@@ -84,14 +91,14 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# 8. Convenience symlinks into repo dir
+# 9. Convenience symlinks into repo dir
 # -----------------------------------------------------------------------------
 ln -sfn /data/checkpoints "$REPO_DIR/checkpoints" 2>/dev/null || true
 ln -sfn /data/datasets    "$REPO_DIR/datasets"    2>/dev/null || true
 ln -sfn /data/logs        "$REPO_DIR/logs"        2>/dev/null || true
 
 # -----------------------------------------------------------------------------
-# 9. Ready — keep alive for interactive SSH use
+# 10. Ready — keep alive for interactive SSH use
 #    To auto-start training: replace with: exec uv run train.py
 # -----------------------------------------------------------------------------
 echo "[startup] Ready — repo at $REPO_DIR"
