@@ -17,11 +17,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+# CHANGED: replaced kernels-based flash attention loader with flash_attn package.
+# Original code was:
+#   from kernels import get_kernel
+#   cap = torch.cuda.get_device_capability()
+#   repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
+#   fa3 = get_kernel(repo).flash_attn_interface
+# and the call site was: fa3.flash_attn_func(q, k, v, ...)
+# Reason: kernels-community/flash-attn3 had no compatible build variant for RTX 4090 (sm_89).
+# To revert: uninstall flash-attn, restore the above, and remove the q/k/v cast below.
+from flash_attn import flash_attn_func
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -89,8 +94,9 @@ class CausalSelfAttention(nn.Module):
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
+        q, k, v = q.bfloat16(), k.bfloat16(), v.bfloat16()  # CHANGED: cast required; flash_attn only accepts fp16/bf16 (F.rms_norm returns fp32)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        y = flash_attn_func(q, k, v, causal=True, window_size=window_size)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -448,7 +454,7 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
 DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+DEVICE_BATCH_SIZE = 32   # per-device batch size (reduce if OOM) — CHANGED from 128 (OOM on RTX 4090)
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -628,3 +634,16 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+
+# Save final checkpoint
+ckpt_dir = "/data/checkpoints"
+os.makedirs(ckpt_dir, exist_ok=True)
+ckpt_path = os.path.join(ckpt_dir, f"checkpoint_step{step:05d}.pt")
+torch.save({
+    "model": model._orig_mod.state_dict(),
+    "config": asdict(config),
+    "step": step,
+    "val_bpb": val_bpb,
+    "total_tokens": total_tokens,
+}, ckpt_path)
+print(f"checkpoint:       {ckpt_path}")
