@@ -11,6 +11,7 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 import gc
 import math
 import time
+from datetime import datetime
 from dataclasses import dataclass, asdict, field
 
 import torch
@@ -64,8 +65,9 @@ def apply_rotary_emb(x, cos, sin):
     assert x.ndim == 4
     d = x.shape[3] // 2
     x1, x2 = x[..., :d], x[..., d:]
-    y1 = x1 * cos + x2 * sin
-    y2 = x1 * (-sin) + x2 * cos
+    # Slice cos/sin to match this block's head_dim (cos/sin are precomputed for max head_dim)
+    y1 = x1 * cos[..., :d] + x2 * sin[..., :d]
+    y2 = x1 * (-sin[..., :d]) + x2 * cos[..., :d]
     return torch.cat([y1, y2], 3)
 
 
@@ -144,7 +146,7 @@ class GPT(nn.Module):
         self.window_sizes = [bc.window_size for bc in self.block_configs]
         bc0 = self.block_configs[0]
         bc_last = self.block_configs[-1]
-        head_dim = bc0.n_embd // bc0.n_head
+        head_dim = max(bc.n_embd // bc.n_head for bc in self.block_configs)
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(config.vocab_size, bc0.n_embd),
             "h": nn.ModuleList([Block(bc) for bc in self.block_configs]),
@@ -190,8 +192,7 @@ class GPT(nn.Module):
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
         # Rotary embeddings
-        bc0 = self.block_configs[0]
-        head_dim = bc0.n_embd // bc0.n_head
+        head_dim = max(bc.n_embd // bc.n_head for bc in self.block_configs)
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
         # Cast embeddings to bf16
@@ -479,15 +480,19 @@ tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
 print(f"Vocab size: {vocab_size:,}")
 
-S   = BlockConfig(n_head=4, n_kv_head=4, n_embd=512, has_ve=False, window_size=(1024, 0))
-SVE = BlockConfig(n_head=4, n_kv_head=4, n_embd=512, has_ve=True,  window_size=(1024, 0))
-LVE = BlockConfig(n_head=4, n_kv_head=4, n_embd=512, has_ve=True,  window_size=(2048, 0))
+S    = BlockConfig(n_head=4, n_kv_head=4, n_embd=512, has_ve=False, window_size=(1024, 0))
+SVE  = BlockConfig(n_head=4, n_kv_head=4, n_embd=512, has_ve=True,  window_size=(1024, 0))
+LVE  = BlockConfig(n_head=4, n_kv_head=4, n_embd=512, has_ve=True,  window_size=(2048, 0))
+# Narrow variants (384) for first 2 and last 2 layers; n_model=512 residual stream is preserved
+SN   = BlockConfig(n_head=4, n_kv_head=4, n_embd=384, has_ve=False, window_size=(1024, 0))
+SVEN = BlockConfig(n_head=4, n_kv_head=4, n_embd=384, has_ve=True,  window_size=(1024, 0))
+LVEN = BlockConfig(n_head=4, n_kv_head=4, n_embd=384, has_ve=True,  window_size=(2048, 0))
 
 config = GPTConfig(
     sequence_len=MAX_SEQ_LEN,
     vocab_size=vocab_size,
     n_model=512,
-    blocks=[S, SVE, S, LVE, S, SVE, S, LVE],
+    blocks=[SN, SVEN, S, LVE, S, SVE, SN, LVEN],
 )
 print(f"Model config: {asdict(config)}")
 
@@ -644,7 +649,7 @@ print(f"depth:            {config.n_layer}")
 # Save final checkpoint
 ckpt_dir = "/data/checkpoints"
 os.makedirs(ckpt_dir, exist_ok=True)
-ckpt_path = os.path.join(ckpt_dir, f"checkpoint_step{step:05d}.pt")
+ckpt_path = os.path.join(ckpt_dir, f"checkpoint_{datetime.now().strftime('%Y%m%d_%H%M%S')}_step{step:05d}.pt")
 torch.save({
     "model": model._orig_mod.state_dict(),
     "config": asdict(config),
