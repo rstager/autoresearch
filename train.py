@@ -492,7 +492,7 @@ config = GPTConfig(
     sequence_len=MAX_SEQ_LEN,
     vocab_size=vocab_size,
     n_model=512,
-    blocks=[SN, SVEN, S, LVE, S, SVE, SN, LVEN],
+    blocks=[S, SVE, S, LVE, S, SVE, S, LVE],
 )
 print(f"Model config: {asdict(config)}")
 
