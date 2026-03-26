@@ -70,7 +70,13 @@ export TMPDIR="${TMPDIR:-/scratch/tmp}"
 export PYTHONPATH="${PYTHONPATH:-$REPO_DIR}"
 
 # -----------------------------------------------------------------------------
-# 7. Configure git credentials from GITHUB_TOKEN env var
+# 7. Install system utilities
+# -----------------------------------------------------------------------------
+echo "[startup] Installing system utilities..."
+apt-get update -qq && apt-get install -y -qq tmux vim
+
+# -----------------------------------------------------------------------------
+# 8. Configure git credentials from GITHUB_TOKEN env var
 # -----------------------------------------------------------------------------
 if [ -n "${GITHUB_TOKEN:-}" ]; then
     echo "[startup] Configuring git credentials from GITHUB_TOKEN"
@@ -81,7 +87,13 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# 8. Install uv if not already installed
+# 9. Configure git user identity
+# -----------------------------------------------------------------------------
+git config --global user.name "${GIT_USER_NAME:-Roger}"
+git config --global user.email "${GIT_USER_EMAIL:-rkstager@gmail.com}"
+
+# -----------------------------------------------------------------------------
+# 10. Install uv if not already installed
 # -----------------------------------------------------------------------------
 UV_BASHRC_MARKER="# cloud: uv PATH"
 if ! command -v uv &>/dev/null; then
@@ -104,14 +116,42 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# 9. Install project dependencies into system Python
+# 11. Install project dependencies into system Python
 # -----------------------------------------------------------------------------
 echo "[startup] Installing project dependencies..."
 uv pip install --system --python python3.11 \
     $(python3.11 -c "import tomllib; deps=tomllib.load(open('$REPO_DIR/pyproject.toml','rb'))['project']['dependencies']; print(' '.join(deps))")
 
+# flash-attn is required by train.py but not in pyproject.toml (needs CUDA to build)
+if ! python3.11 -c "import flash_attn" 2>/dev/null; then
+    echo "[startup] Installing flash-attn (may take several minutes)..."
+    uv pip install --system --python python3.11 flash-attn
+fi
+
 # -----------------------------------------------------------------------------
-# 10. DATA SETUP — download data if not already present
+# 12. Restore user configs (tmux, Claude Code state)
+# -----------------------------------------------------------------------------
+# tmux config
+cat > /root/.tmux.conf << 'EOF'
+set -g mouse on
+set -g default-terminal "xterm-256color"
+EOF
+
+# Restore Claude Code memory and settings from workspace backup
+CLAUDE_BACKUP="$REPO_DIR/.claude-state"
+CLAUDE_PROJECT="/root/.claude/projects/-workspace-autoresearch"
+if [ -d "$CLAUDE_BACKUP/memory" ]; then
+    echo "[startup] Restoring Claude Code memory from backup"
+    mkdir -p "$CLAUDE_PROJECT/memory"
+    cp -a "$CLAUDE_BACKUP/memory/"* "$CLAUDE_PROJECT/memory/" 2>/dev/null || true
+fi
+if [ -f "$CLAUDE_BACKUP/settings.json" ]; then
+    mkdir -p /root/.claude
+    cp "$CLAUDE_BACKUP/settings.json" /root/.claude/settings.json
+fi
+
+# -----------------------------------------------------------------------------
+# 13. DATA SETUP — download data if not already present
 # -----------------------------------------------------------------------------
 DATA_READY_FLAG="/data/datasets/.ready"
 if [ ! -f "$DATA_READY_FLAG" ]; then
@@ -124,14 +164,14 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# 11. Convenience symlinks into repo dir
+# 14. Convenience symlinks into repo dir
 # -----------------------------------------------------------------------------
 ln -sfn /data/checkpoints "$REPO_DIR/checkpoints" 2>/dev/null || true
 ln -sfn /data/datasets    "$REPO_DIR/datasets"    2>/dev/null || true
 ln -sfn /data/logs        "$REPO_DIR/logs"        2>/dev/null || true
 
 # -----------------------------------------------------------------------------
-# 12. Install Claude Code if not already installed
+# 15. Install Claude Code if not already installed
 # -----------------------------------------------------------------------------
 CLAUDE_BASHRC_MARKER="# cloud: claude-code PATH"
 if ! command -v claude &>/dev/null; then
@@ -154,7 +194,17 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# 13. Ready — keep alive for interactive SSH use
+# 16. Background sync: periodically back up Claude state to /workspace
+# -----------------------------------------------------------------------------
+(while true; do
+    sleep 300
+    mkdir -p "$CLAUDE_BACKUP/memory"
+    cp -a "$CLAUDE_PROJECT/memory/"* "$CLAUDE_BACKUP/memory/" 2>/dev/null || true
+    [ -f /root/.claude/settings.json ] && cp /root/.claude/settings.json "$CLAUDE_BACKUP/settings.json"
+done) &
+
+# -----------------------------------------------------------------------------
+# 17. Ready — keep alive for interactive SSH use
 #    To auto-start training: replace with: exec uv run train.py
 # -----------------------------------------------------------------------------
 echo "[startup] Ready — repo at $REPO_DIR"

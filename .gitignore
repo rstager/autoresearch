@@ -14,3 +14,4 @@ dev/
 # Results file
 results.tsv
 .env
+.claude-state/
