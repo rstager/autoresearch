@@ -38,135 +38,7 @@ BASHEOF
 fi
 
 # -----------------------------------------------------------------------------
-# 3. GPU check
-# -----------------------------------------------------------------------------
-echo "[startup] GPU:"
-nvidia-smi --query-gpu=name,memory.total --format=csv,noheader \
-    || echo "[startup] WARNING: nvidia-smi failed"
-
-# -----------------------------------------------------------------------------
-# 4. Volume / disk check
-# -----------------------------------------------------------------------------
-for vol in /workspace /data /scratch; do
-    if [ -d "$vol" ]; then
-        echo "[startup] $vol: $(df -h "$vol" | tail -1 | awk '{print $4}') free"
-    else
-        echo "[startup] WARNING: $vol not available"
-    fi
-done
-
-# -----------------------------------------------------------------------------
-# 5. Standard directories
-# -----------------------------------------------------------------------------
-mkdir -p /data/datasets /data/checkpoints /data/logs /data/wandb /data/.cache/huggingface
-mkdir -p /scratch/tmp /scratch/compile
-
-# -----------------------------------------------------------------------------
-# 6. Export standard paths
-# -----------------------------------------------------------------------------
-export HF_HOME="${HF_HOME:-/data/.cache/huggingface}"
-export WANDB_DIR="${WANDB_DIR:-/data/wandb}"
-export TMPDIR="${TMPDIR:-/scratch/tmp}"
-export PYTHONPATH="${PYTHONPATH:-$REPO_DIR}"
-
-# -----------------------------------------------------------------------------
-# 7. Install system utilities
-# -----------------------------------------------------------------------------
-echo "[startup] Installing system utilities..."
-apt-get update -qq && apt-get install -y -qq tmux vim
-
-# -----------------------------------------------------------------------------
-# 8. Configure git credentials from GITHUB_TOKEN env var
-# -----------------------------------------------------------------------------
-if [ -n "${GITHUB_TOKEN:-}" ]; then
-    echo "[startup] Configuring git credentials from GITHUB_TOKEN"
-    git config --global credential.helper store
-    echo "https://x-token:${GITHUB_TOKEN}@github.com" > ~/.git-credentials
-else
-    echo "[startup] NOTE: GITHUB_TOKEN not set — git push will require manual auth"
-fi
-
-# -----------------------------------------------------------------------------
-# 9. Configure git user identity
-# -----------------------------------------------------------------------------
-git config --global user.name "${GIT_USER_NAME:-Roger}"
-git config --global user.email "${GIT_USER_EMAIL:-rkstager@gmail.com}"
-
-# -----------------------------------------------------------------------------
-# 10. Install uv if not already installed
-# -----------------------------------------------------------------------------
-UV_BASHRC_MARKER="# cloud: uv PATH"
-if ! command -v uv &>/dev/null; then
-    echo "[startup] Installing uv..."
-    curl -fsSL https://astral.sh/uv/install.sh | sh
-fi
-if ! grep -qF "$UV_BASHRC_MARKER" "$BASHRC" 2>/dev/null; then
-    echo "[startup] Adding uv to PATH in $BASHRC"
-    cat >> "$BASHRC" << BASHEOF
-
-$UV_BASHRC_MARKER
-export PATH="\$HOME/.local/bin:\$PATH"
-BASHEOF
-fi
-export PATH="$HOME/.local/bin:$PATH"
-if command -v uv &>/dev/null; then
-    echo "[startup] uv ready: $(uv --version)"
-else
-    echo "[startup] WARNING: uv binary not found after install"
-fi
-
-# -----------------------------------------------------------------------------
-# 11. Install project dependencies into system Python
-# -----------------------------------------------------------------------------
-echo "[startup] Installing project dependencies..."
-uv pip install --system --python python3.11 \
-    $(python3.11 -c "import tomllib; deps=tomllib.load(open('$REPO_DIR/pyproject.toml','rb'))['project']['dependencies']; print(' '.join(deps))")
-
-# flash-attn is required by train.py but not in pyproject.toml (needs CUDA to build)
-if ! python3.11 -c "import flash_attn" 2>/dev/null; then
-    echo "[startup] Installing flash-attn (may take several minutes)..."
-    uv pip install --system --python python3.11 flash-attn
-fi
-
-# -----------------------------------------------------------------------------
-# 12. Restore user configs (tmux) and symlink ~/.claude to /workspace
-# -----------------------------------------------------------------------------
-cat > /root/.tmux.conf << 'EOF'
-set -g mouse on
-set -g default-terminal "xterm-256color"
-EOF
-
-# Symlink ~/.claude to persistent storage so credentials, memory, settings survive
-mkdir -p /workspace/.claude
-if [ -d /root/.claude ] && [ ! -L /root/.claude ]; then
-    # First run after fresh root: merge any installer state into persistent dir
-    cp -a /root/.claude/. /workspace/.claude/ 2>/dev/null || true
-    rm -rf /root/.claude
-fi
-ln -sfn /workspace/.claude /root/.claude
-
-# -----------------------------------------------------------------------------
-# 13. DATA SETUP — download data if not already present
-# -----------------------------------------------------------------------------
-DATA_READY_FLAG="/data/datasets/.ready"
-if [ ! -f "$DATA_READY_FLAG" ]; then
-    echo "[startup] Downloading data (prepare.py)..."
-    cd "$REPO_DIR"
-    python3.11 prepare.py
-    touch "$DATA_READY_FLAG"
-else
-    echo "[startup] Data already present, skipping download"
-fi
-
-# -----------------------------------------------------------------------------
-# 14. Convenience symlinks into repo dir
-# -----------------------------------------------------------------------------
-ln -sfn /data/checkpoints "$REPO_DIR/checkpoints" 2>/dev/null || true
-ln -sfn /data/datasets    "$REPO_DIR/datasets"    2>/dev/null || true
-ln -sfn /data/logs        "$REPO_DIR/logs"        2>/dev/null || true
-
-# -----------------------------------------------------------------------------
-# 15. Install Claude Code if not already installed
+# 3. Install Claude Code if not already installed
 # -----------------------------------------------------------------------------
 CLAUDE_BASHRC_MARKER="# cloud: claude-code PATH"
 if ! command -v claude &>/dev/null; then
@@ -189,9 +61,136 @@ else
 fi
 
 # -----------------------------------------------------------------------------
+# 4. GPU check
+# -----------------------------------------------------------------------------
+echo "[startup] GPU:"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader \
+    || echo "[startup] WARNING: nvidia-smi failed"
+
+# -----------------------------------------------------------------------------
+# 5. Volume / disk check
+# -----------------------------------------------------------------------------
+for vol in /workspace /data /scratch; do
+    if [ -d "$vol" ]; then
+        echo "[startup] $vol: $(df -h "$vol" | tail -1 | awk '{print $4}') free"
+    else
+        echo "[startup] WARNING: $vol not available"
+    fi
+done
+
+# -----------------------------------------------------------------------------
+# 6. Standard directories
+# -----------------------------------------------------------------------------
+mkdir -p /data/datasets /data/checkpoints /data/logs /data/wandb /data/.cache/huggingface
+mkdir -p /scratch/tmp /scratch/compile
+
+# -----------------------------------------------------------------------------
+# 7. Export standard paths
+# -----------------------------------------------------------------------------
+export HF_HOME="${HF_HOME:-/data/.cache/huggingface}"
+export WANDB_DIR="${WANDB_DIR:-/data/wandb}"
+export TMPDIR="${TMPDIR:-/scratch/tmp}"
+export PYTHONPATH="${PYTHONPATH:-$REPO_DIR}"
+
+# -----------------------------------------------------------------------------
+# 8. Install system utilities
+# -----------------------------------------------------------------------------
+echo "[startup] Installing system utilities..."
+apt-get update -qq && apt-get install -y -qq tmux vim
+
+# -----------------------------------------------------------------------------
+# 9. Configure git credentials from GITHUB_TOKEN env var
+# -----------------------------------------------------------------------------
+if [ -n "${GITHUB_TOKEN:-}" ]; then
+    echo "[startup] Configuring git credentials from GITHUB_TOKEN"
+    git config --global credential.helper store
+    echo "https://x-token:${GITHUB_TOKEN}@github.com" > ~/.git-credentials
+else
+    echo "[startup] NOTE: GITHUB_TOKEN not set — git push will require manual auth"
+fi
+
+# -----------------------------------------------------------------------------
+# 10. Configure git user identity
+# -----------------------------------------------------------------------------
+git config --global user.name "${GIT_USER_NAME:-Roger}"
+git config --global user.email "${GIT_USER_EMAIL:-rkstager@gmail.com}"
+
+# -----------------------------------------------------------------------------
+# 11. Install uv if not already installed
+# -----------------------------------------------------------------------------
+UV_BASHRC_MARKER="# cloud: uv PATH"
+if ! command -v uv &>/dev/null; then
+    echo "[startup] Installing uv..."
+    curl -fsSL https://astral.sh/uv/install.sh | sh
+fi
+if ! grep -qF "$UV_BASHRC_MARKER" "$BASHRC" 2>/dev/null; then
+    echo "[startup] Adding uv to PATH in $BASHRC"
+    cat >> "$BASHRC" << BASHEOF
+
+$UV_BASHRC_MARKER
+export PATH="\$HOME/.local/bin:\$PATH"
+BASHEOF
+fi
+export PATH="$HOME/.local/bin:$PATH"
+if command -v uv &>/dev/null; then
+    echo "[startup] uv ready: $(uv --version)"
+else
+    echo "[startup] WARNING: uv binary not found after install"
+fi
+
+# -----------------------------------------------------------------------------
+# 12. Install project dependencies into system Python
+# -----------------------------------------------------------------------------
+echo "[startup] Installing project dependencies..."
+uv pip install --system --python python3.11 \
+    $(python3.11 -c "import tomllib; deps=tomllib.load(open('$REPO_DIR/pyproject.toml','rb'))['project']['dependencies']; print(' '.join(deps))")
+
+# flash-attn is required by train.py but not in pyproject.toml (needs CUDA to build)
+if ! python3.11 -c "import flash_attn" 2>/dev/null; then
+    echo "[startup] Installing flash-attn (may take several minutes)..."
+    uv pip install --system --python python3.11 flash-attn --no-build-isolation
+fi
+
+# -----------------------------------------------------------------------------
+# 13. Restore user configs (tmux) and symlink ~/.claude to /workspace
+# -----------------------------------------------------------------------------
+cat > /root/.tmux.conf << 'EOF'
+set -g mouse on
+set -g default-terminal "xterm-256color"
+EOF
+
+# Symlink ~/.claude to persistent storage so credentials, memory, settings survive
+mkdir -p /workspace/.claude
+if [ -d /root/.claude ] && [ ! -L /root/.claude ]; then
+    # First run after fresh root: merge any installer state into persistent dir
+    cp -a /root/.claude/. /workspace/.claude/ 2>/dev/null || true
+    rm -rf /root/.claude
+fi
+ln -sfn /workspace/.claude /root/.claude
+
+# -----------------------------------------------------------------------------
+# 14. DATA SETUP — download data if not already present
+# -----------------------------------------------------------------------------
+DATA_READY_FLAG="/data/datasets/.ready"
+if [ ! -f "$DATA_READY_FLAG" ]; then
+    echo "[startup] Downloading data (prepare.py)..."
+    cd "$REPO_DIR"
+    python3.11 prepare.py
+    touch "$DATA_READY_FLAG"
+else
+    echo "[startup] Data already present, skipping download"
+fi
+
+# -----------------------------------------------------------------------------
+# 15. Convenience symlinks into repo dir
+# -----------------------------------------------------------------------------
+ln -sfn /data/checkpoints "$REPO_DIR/checkpoints" 2>/dev/null || true
+ln -sfn /data/datasets    "$REPO_DIR/datasets"    2>/dev/null || true
+ln -sfn /data/logs        "$REPO_DIR/logs"        2>/dev/null || true
+
+# -----------------------------------------------------------------------------
 # 16. Ready — keep alive for interactive SSH use
 #    To auto-start training: replace with: exec uv run train.py
 # -----------------------------------------------------------------------------
 echo "[startup] Ready — repo at $REPO_DIR"
 cd "$REPO_DIR"
-tail -f /dev/null
