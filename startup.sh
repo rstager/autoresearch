@@ -70,7 +70,18 @@ export TMPDIR="${TMPDIR:-/scratch/tmp}"
 export PYTHONPATH="${PYTHONPATH:-$REPO_DIR}"
 
 # -----------------------------------------------------------------------------
-# 7. Install uv if not already installed
+# 7. Configure git credentials from GITHUB_TOKEN env var
+# -----------------------------------------------------------------------------
+if [ -n "${GITHUB_TOKEN:-}" ]; then
+    echo "[startup] Configuring git credentials from GITHUB_TOKEN"
+    git config --global credential.helper store
+    echo "https://x-token:${GITHUB_TOKEN}@github.com" > ~/.git-credentials
+else
+    echo "[startup] NOTE: GITHUB_TOKEN not set — git push will require manual auth"
+fi
+
+# -----------------------------------------------------------------------------
+# 8. Install uv if not already installed
 # -----------------------------------------------------------------------------
 UV_BASHRC_MARKER="# cloud: uv PATH"
 if ! command -v uv &>/dev/null; then
@@ -93,14 +104,14 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# 8. Install project dependencies into system Python
+# 9. Install project dependencies into system Python
 # -----------------------------------------------------------------------------
 echo "[startup] Installing project dependencies..."
 uv pip install --system --python python3.11 \
     $(python3.11 -c "import tomllib; deps=tomllib.load(open('$REPO_DIR/pyproject.toml','rb'))['project']['dependencies']; print(' '.join(deps))")
 
 # -----------------------------------------------------------------------------
-# 9. DATA SETUP — download data if not already present
+# 10. DATA SETUP — download data if not already present
 # -----------------------------------------------------------------------------
 DATA_READY_FLAG="/data/datasets/.ready"
 if [ ! -f "$DATA_READY_FLAG" ]; then
@@ -113,14 +124,14 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# 10. Convenience symlinks into repo dir
+# 11. Convenience symlinks into repo dir
 # -----------------------------------------------------------------------------
 ln -sfn /data/checkpoints "$REPO_DIR/checkpoints" 2>/dev/null || true
 ln -sfn /data/datasets    "$REPO_DIR/datasets"    2>/dev/null || true
 ln -sfn /data/logs        "$REPO_DIR/logs"        2>/dev/null || true
 
 # -----------------------------------------------------------------------------
-# 11. Install Claude Code if not already installed
+# 12. Install Claude Code if not already installed
 # -----------------------------------------------------------------------------
 CLAUDE_BASHRC_MARKER="# cloud: claude-code PATH"
 if ! command -v claude &>/dev/null; then
@@ -143,7 +154,7 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# 12. Ready — keep alive for interactive SSH use
+# 13. Ready — keep alive for interactive SSH use
 #    To auto-start training: replace with: exec uv run train.py
 # -----------------------------------------------------------------------------
 echo "[startup] Ready — repo at $REPO_DIR"
