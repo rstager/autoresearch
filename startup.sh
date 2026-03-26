@@ -129,26 +129,21 @@ if ! python3.11 -c "import flash_attn" 2>/dev/null; then
 fi
 
 # -----------------------------------------------------------------------------
-# 12. Restore user configs (tmux, Claude Code state)
+# 12. Restore user configs (tmux) and symlink ~/.claude to /workspace
 # -----------------------------------------------------------------------------
-# tmux config
 cat > /root/.tmux.conf << 'EOF'
 set -g mouse on
 set -g default-terminal "xterm-256color"
 EOF
 
-# Restore Claude Code memory and settings from workspace backup
-CLAUDE_BACKUP="$REPO_DIR/.claude-state"
-CLAUDE_PROJECT="/root/.claude/projects/-workspace-autoresearch"
-if [ -d "$CLAUDE_BACKUP/memory" ]; then
-    echo "[startup] Restoring Claude Code memory from backup"
-    mkdir -p "$CLAUDE_PROJECT/memory"
-    cp -a "$CLAUDE_BACKUP/memory/"* "$CLAUDE_PROJECT/memory/" 2>/dev/null || true
+# Symlink ~/.claude to persistent storage so credentials, memory, settings survive
+mkdir -p /workspace/.claude
+if [ -d /root/.claude ] && [ ! -L /root/.claude ]; then
+    # First run after fresh root: merge any installer state into persistent dir
+    cp -a /root/.claude/. /workspace/.claude/ 2>/dev/null || true
+    rm -rf /root/.claude
 fi
-if [ -f "$CLAUDE_BACKUP/settings.json" ]; then
-    mkdir -p /root/.claude
-    cp "$CLAUDE_BACKUP/settings.json" /root/.claude/settings.json
-fi
+ln -sfn /workspace/.claude /root/.claude
 
 # -----------------------------------------------------------------------------
 # 13. DATA SETUP — download data if not already present
@@ -194,17 +189,7 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# 16. Background sync: periodically back up Claude state to /workspace
-# -----------------------------------------------------------------------------
-(while true; do
-    sleep 300
-    mkdir -p "$CLAUDE_BACKUP/memory"
-    cp -a "$CLAUDE_PROJECT/memory/"* "$CLAUDE_BACKUP/memory/" 2>/dev/null || true
-    [ -f /root/.claude/settings.json ] && cp /root/.claude/settings.json "$CLAUDE_BACKUP/settings.json"
-done) &
-
-# -----------------------------------------------------------------------------
-# 17. Ready — keep alive for interactive SSH use
+# 16. Ready — keep alive for interactive SSH use
 #    To auto-start training: replace with: exec uv run train.py
 # -----------------------------------------------------------------------------
 echo "[startup] Ready — repo at $REPO_DIR"
