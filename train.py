@@ -484,13 +484,13 @@ S    = BlockConfig(n_head=4, n_kv_head=4, n_embd=384, has_ve=False, window_size=
 SVE  = BlockConfig(n_head=4, n_kv_head=4, n_embd=384, has_ve=True,  window_size=(1024, 0))
 LVE  = BlockConfig(n_head=4, n_kv_head=4, n_embd=384, has_ve=True,  window_size=(2048, 0))
 
-# 12 layers, LVE every 3rd layer (denser global attention coverage).
-# 4 S + 4 SVE + 4 LVE vs current 6 S + 3 SVE + 3 LVE.
+# Same block counts as [S,SVE,LVE,×4] but LVE clustered at the end.
+# Hypothesis: local processing first, then global context at the end.
 config = GPTConfig(
     sequence_len=MAX_SEQ_LEN,
     vocab_size=vocab_size,
     n_model=384,
-    blocks=[S, SVE, LVE, S, SVE, LVE, S, SVE, LVE, S, SVE, LVE],
+    blocks=[S, SVE, S, SVE, S, SVE, S, SVE, LVE, LVE, LVE, LVE],
 )
 print(f"Model config: {asdict(config)}")
 
