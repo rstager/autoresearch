@@ -481,11 +481,11 @@ vocab_size = tokenizer.get_vocab_size()
 print(f"Vocab size: {vocab_size:,}")
 
 S    = BlockConfig(n_head=4, n_kv_head=4, n_embd=384, has_ve=False, window_size=(512, 0))
-SVE  = BlockConfig(n_head=4, n_kv_head=4, n_embd=384, has_ve=True,  window_size=(1024, 0))
+SVE  = BlockConfig(n_head=4, n_kv_head=4, n_embd=384, has_ve=True,  window_size=(512, 0))
 LVE  = BlockConfig(n_head=4, n_kv_head=4, n_embd=384, has_ve=True,  window_size=(2048, 0))
 
-# S with shorter window=512 (vs 1024): halves S attention cost -> ~7% more steps.
-# S is already "cheap local" — very short window should be fine.
+# Also shorten SVE window: 1024->512. All local layers use 512 window.
+# LVE handles all long-range context. ~7% more steps vs current.
 config = GPTConfig(
     sequence_len=MAX_SEQ_LEN,
     vocab_size=vocab_size,
