@@ -462,7 +462,7 @@ WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
-DEVICE_BATCH_SIZE = 32   # per-device batch size (reduce if OOM) — CHANGED from 128 (OOM on RTX 4090)
+DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -480,16 +480,15 @@ tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
 print(f"Vocab size: {vocab_size:,}")
 
-S    = BlockConfig(n_head=4, n_kv_head=2, n_embd=384, has_ve=False, window_size=(512, 0))
-SVE  = BlockConfig(n_head=4, n_kv_head=2, n_embd=384, has_ve=True,  window_size=(512, 0))
-LVE  = BlockConfig(n_head=4, n_kv_head=4, n_embd=384, has_ve=True,  window_size=(2048, 0))
+S   = BlockConfig(n_head=4, n_kv_head=4, n_embd=512, has_ve=False, window_size=(1024, 0))
+SVE = BlockConfig(n_head=4, n_kv_head=4, n_embd=512, has_ve=True,  window_size=(1024, 0))
+LVE = BlockConfig(n_head=4, n_kv_head=4, n_embd=512, has_ve=True,  window_size=(2048, 0))
 
-# GQA for local only (n_kv_head=2): full KV reserved for global attention
 config = GPTConfig(
     sequence_len=MAX_SEQ_LEN,
     vocab_size=vocab_size,
-    n_model=384,
-    blocks=[S, SVE, S, SVE, S, SVE, S, SVE, LVE, LVE, LVE, LVE],
+    n_model=512,
+    blocks=[S, SVE, S, LVE, S, SVE, S, LVE],
 )
 print(f"Model config: {asdict(config)}")
 
