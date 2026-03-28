@@ -176,9 +176,9 @@ LOOP FOREVER:
 8. **Log all N results** to `results.tsv` (one row per experiment, including crashes).
 9. **After any `keep`**: push the branch and update `state.md`:
    ```bash
-   git push origin HEAD
+   git push origin HEAD || true
    ```
-   Then rewrite `state.md` (see **State file** section below). Commit and push `state.md` separately so it's always current on the remote.
+   Push failures are non-fatal — log a warning and continue. Then rewrite `state.md` (see **State file** section below). Commit `state.md` and attempt to push it too (`git push origin HEAD || true`). If push fails, the state is still preserved locally and will be pushed on the next successful push.
 10. **Reset worktrees**: Each worktree should be reset to the new HEAD before the next batch:
     ```bash
     cd /tmp/autoresearch-gpu$i && git reset --hard <new_HEAD>
