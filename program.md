@@ -28,8 +28,9 @@ To set up a new experiment, work with the user to:
      git worktree add /tmp/autoresearch-gpu$i HEAD
    done
    ```
-7. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first batch.
-8. **Confirm and go**: Confirm setup looks good.
+8. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first batch.
+9. **Initialize state.md**: Create an initial `state.md` with the session branch, date, hypothesis, and current baseline config. Commit and push it.
+10. **Confirm and go**: Confirm setup looks good.
 
 Once you get confirmation, kick off the experimentation.
 
@@ -173,11 +174,16 @@ LOOP FOREVER:
    - Log all confirmation runs to `results.tsv` (same commit hash, different seeds noted in description).
 7. **If no improvement**: Mark all as `discard`. Branch stays at current HEAD.
 8. **Log all N results** to `results.tsv` (one row per experiment, including crashes).
-9. **Reset worktrees**: Each worktree should be reset to the new HEAD before the next batch:
+9. **After any `keep`**: push the branch and update `state.md`:
    ```bash
-   cd /tmp/autoresearch-gpu$i && git reset --hard <new_HEAD>
+   git push origin HEAD
    ```
-10. **Loop back** to step 1 immediately. Never pause to ask the human.
+   Then rewrite `state.md` (see **State file** section below). Commit and push `state.md` separately so it's always current on the remote.
+10. **Reset worktrees**: Each worktree should be reset to the new HEAD before the next batch:
+    ```bash
+    cd /tmp/autoresearch-gpu$i && git reset --hard <new_HEAD>
+    ```
+11. **Loop back** to step 1 immediately. Never pause to ask the human.
 
 **Confirmation runs** are enabled by default. To disable (e.g. during rapid early exploration or if GPU time is scarce), the human can say "skip confirmation" at session start. When disabled, step 6 reduces to: cherry-pick immediately on any improvement, mark as `keep`.
 
@@ -188,6 +194,45 @@ LOOP FOREVER:
 **NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
 
 As an example use case, a user might leave you running while they sleep. If each experiment takes you ~5 minutes and you have 4 GPUs, you can run approx 48/hour, for a total of about 400 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
+
+## State file
+
+`state.md` is a human-readable summary of session progress, committed and pushed to the branch after every `keep`. It allows the experiment to be resumed after an interruption without losing context.
+
+**Location**: `state.md` in the repo root (tracked by git, pushed to remote).
+
+**Update it after every confirmed `keep`** by rewriting the entire file. It should contain:
+
+```markdown
+# Experiment State
+
+## Session
+- Branch: autoresearch/<tag>
+- Started: <date>
+- Last updated: <date/time>
+- Best val_bpb so far: <float> (commit <hash>)
+
+## Hypothesis being tested
+<One paragraph reminding the orchestrator of the architectural hypothesis:
+narrow early layers, wide middle, narrow-but-wide-input late layers.
+Update this if the focus has shifted based on what's been learned.>
+
+## What has been tried
+<Bullet list of experiments, grouped by theme. Include what worked, what
+didn't, and any patterns noticed. This is the orchestrator's memory — write
+it so a fresh Claude instance can pick up where you left off without reading
+every results.tsv row.>
+
+## Current best config
+<Paste the relevant BlockConfig / GPTConfig lines from the current train.py
+so the baseline is immediately visible on resume.>
+
+## Next directions to explore
+<2–4 concrete hypotheses worth trying next, based on what's been learned.
+Update this after each batch so it's always forward-looking.>
+```
+
+**On resume**: Read `state.md` first. It tells you where you are, what's been learned, and what to try next. Then read `results.tsv` for the full numerical record. Then read the current `train.py` for the exact config.
 
 ## Sub-agent Protocol
 
