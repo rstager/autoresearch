@@ -43,15 +43,43 @@ CUDA_VISIBLE_DEVICES=<gpu_id> uv run train.py
 
 `CUDA_VISIBLE_DEVICES` restricts PyTorch to a single GPU; the script sees it as `cuda:0` regardless of physical index.
 
-**What you CAN do:**
-- Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, etc.
+**What you CAN change** (the scope of this experiment):
 
-**What you CANNOT do:**
-- Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, tokenizer, and training constants (time budget, sequence length, etc).
-- Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
-- Modify the evaluation harness. The `evaluate_bpb` function in `prepare.py` is the ground truth metric.
+This experiment is specifically about **heterogeneous layer architecture** — varying per-layer width and context access across the depth of the network. The hypothesis is that different layers serve different roles:
 
-**The goal is simple: get the lowest val_bpb.** Since the time budget is fixed, you don't need to worry about training time — it's always 5 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
+- **Early layers** establish local token context; they may need less model width and shorter attention windows.
+- **Middle layers** connect and evolve concepts; these benefit most from full width (`n_embd == n_model`) and full context.
+- **Late layers** convert internal representations to token predictions; they may again be narrower, but may benefit from a wide `n_in` so they can read the full residual stream from the middle layers.
+
+The parameters you vary:
+
+| Parameter | Where | What it controls |
+|-----------|-------|-----------------|
+| `n_model` | `GPTConfig` | Width of the full residual stream (shared highway between all layers) |
+| `n_embd` | per `BlockConfig` | Width this block reads/writes — its compute budget. Must be ≤ `n_model`. Controls `head_dim = n_embd // n_head`. |
+| `n_in` | per `BlockConfig` | Width the attention Q/K/V projections read from. `None` = same as `n_embd`. Set wider (up to `n_model`) to let a narrow layer attend over a richer context slice. |
+| `n_head` | per `BlockConfig` | Number of attention heads. Must divide `n_embd`. Adjust when changing `n_embd`. |
+| `n_kv_head` | per `BlockConfig` | Number of KV heads (GQA). Must divide `n_head`. |
+| `has_ve` | per `BlockConfig` | Whether this block uses value embeddings (ResFormer-style). |
+| `window_size` | per `BlockConfig` | `(-1, 0)` = full context; `(k, 0)` = sliding window of size k. |
+| `blocks` list | `GPTConfig` | The sequence of `BlockConfig` objects — defines depth and per-layer config. |
+| Number of layers | implicit | Change by adding/removing entries in `blocks`. |
+
+**Constraints on these parameters:**
+- `n_embd` must divide evenly by `n_head` (head_dim = n_embd // n_head must be a positive integer).
+- `n_kv_head` must divide `n_head` and be ≤ `n_head`.
+- `n_in` must be ≤ `n_model` (you can't read wider than the residual stream).
+- `n_embd` must be ≤ `n_model`.
+- The first block's `n_embd` determines the embedding dimension (`wte` outputs `bc0.n_embd`; if `n_model > bc0.n_embd`, the difference is zero-padded via `wte_pad`).
+- The last block's `n_embd` determines the `lm_head` input width.
+
+**What you CANNOT change** in this experiment:
+- `prepare.py` — read-only. Contains `MAX_SEQ_LEN`, `TIME_BUDGET`, the tokenizer, dataloader, and `evaluate_bpb`.
+- The optimizer (`MuonAdamW`), learning rates, batch size, schedules, or any training hyperparameters — keep these fixed so results reflect architecture differences only.
+- The model's core components: attention mechanism, MLP structure (`relu²`), normalization (`rms_norm`), rotary embeddings, softcap, value embedding gating. Do not change how the model computes — only how it is configured.
+- New packages or dependencies — use only what's in `pyproject.toml`.
+
+**The goal is simple: get the lowest val_bpb.** Find the layer width profile across depth that best fits the hypothesis — narrow early, wide middle, narrow-but-wide-input late — or discover that the data says otherwise.
 
 **VRAM** is a soft constraint. Some increase is acceptable for meaningful val_bpb gains, but it should not blow up dramatically.
 
