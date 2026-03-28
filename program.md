@@ -115,10 +115,10 @@ grep "^val_bpb:\|^peak_vram_mb:" run.log
 
 When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
 
-The TSV has a header row and 5 columns:
+The TSV has a header row and 7 columns:
 
 ```
-commit	val_bpb	memory_gb	status	description
+commit	val_bpb	memory_gb	status	description	analysis	lessons
 ```
 
 1. git commit hash (short, 7 chars) — from the worktree where the experiment ran
@@ -126,20 +126,21 @@ commit	val_bpb	memory_gb	status	description
 3. peak memory in GB, round to .1f (e.g. 12.3 — divide peak_vram_mb by 1024) — use 0.0 for crashes
 4. status: `keep`, `discard`, `crash`, `confirm-keep`, or `confirm-discard`
 5. short text description of what this experiment tried
+6. **analysis**: 1–2 sentences explaining *why* this result succeeded or failed — what mechanism drove the outcome. Be specific: "wider middle layers gave attention heads more representational capacity" not "it worked better".
+7. **lessons**: 1 sentence stating the generalizable insight to carry forward — what this tells us about the hypothesis space. E.g. "narrowing early layers below 256 hurts more than it saves" or "n_in wider than n_embd helps late layers even when n_embd is small".
+
+Leave `analysis` and `lessons` blank (empty tab) for `confirm-keep` and `confirm-discard` rows — those inherit from the original run.
 
 Example:
 
 ```
-commit	val_bpb	memory_gb	status	description
-a1b2c3d	0.997900	44.0	keep	baseline
-b2c3d4e	0.993200	44.2	keep	increase LR to 0.04 (seed=1)
-b2c3d4e	0.994100	44.2	confirm-keep	increase LR to 0.04 (seed=2)
-b2c3d4e	0.993800	44.2	confirm-keep	increase LR to 0.04 (seed=3)
-c3d4e5f	1.005000	44.0	discard	switch to GeLU activation
-d4e5f6g	0.995100	44.1	discard	wider MLP - lucky seed (seed=1)
-d4e5f6g	0.999300	44.1	confirm-discard	wider MLP - lucky seed (seed=2)
-d4e5f6g	0.998700	44.1	confirm-discard	wider MLP - lucky seed (seed=3)
-e5f6g7h	0.000000	0.0	crash	double model width (OOM)
+commit	val_bpb	memory_gb	status	description	analysis	lessons
+a1b2c3d	0.997900	44.0	keep	baseline	Uniform 512-dim 8-layer config	Starting point
+b2c3d4e	0.993200	44.2	keep	narrow early: layers 0-1 n_embd=256 (seed=1)	Early layers at half width reduced param count but attention still captured local patterns effectively	Early layers can be narrowed to 256 without hurting quality
+b2c3d4e	0.994100	44.2	confirm-keep	narrow early: layers 0-1 n_embd=256 (seed=2)
+b2c3d4e	0.993800	44.2	confirm-keep	narrow early: layers 0-1 n_embd=256 (seed=3)
+c3d4e5f	1.005000	44.0	discard	narrow late: last 2 layers n_embd=256	Late layers read lm_head input; narrowing lost too much representational capacity at prediction time	Late layers need full width or wide n_in to preserve prediction quality
+e5f6g7h	0.000000	0.0	crash	double n_model to 1024	OOM — 1024-dim residual stream exceeds VRAM at batch 128	n_model above 512 requires batch size reduction to fit VRAM
 ```
 
 ## Model assignments
@@ -156,7 +157,7 @@ The experiment runs on a dedicated branch (e.g. `autoresearch/mar5`). The **main
 LOOP FOREVER:
 
 1. **Review state**: Look at the current branch HEAD commit and `results.tsv`. Note the best val_bpb so far.
-2. **Generate N ideas**: Come up with N diverse experiment hypotheses (N = number of GPUs). Make them meaningfully different — don't just vary one hyperparameter across all slots.
+2. **Generate N ideas**: Think hard. Come up with N diverse experiment hypotheses (N = number of GPUs). Make them meaningfully different — don't just vary one hyperparameter across all slots. Draw on the `lessons` column of results.tsv and the `state.md` next-directions to guide the choices.
 3. **Spawn N sub-agents in parallel**: Use the Agent tool with `run_in_background=True` and `model="sonnet"` (or `"haiku"`) for each GPU. Pass each sub-agent:
    - Its GPU index (0, 1, …, N-1)
    - Its CPU range (pre-computed in setup, e.g. `0-2` for slot 0)
@@ -164,26 +165,29 @@ LOOP FOREVER:
    - The experiment idea description
    - The current HEAD commit hash to base from
    See the **Sub-agent Protocol** section below.
-4. **Wait for all sub-agents**: They will notify you when done. Collect all results.
-5. **Pick the best**: Identify the lowest val_bpb among all completed (non-crash) runs. Compare to current best.
-6. **If improvement found** — run confirmation (default on, can be disabled):
-   - Spawn up to 3 sub-agents in parallel, each re-running the **same commit** (no train.py changes) with a different random seed on available GPUs. Pass `seed=1`, `seed=2`, `seed=3` (sub-agents set `torch.manual_seed` and `torch.cuda.manual_seed` at the top of the run, or simply pass `PYTHONHASHSEED` — see Sub-agent Protocol).
+4. **Think while waiting**: While the sub-agents run (~5 min), use the time productively. Think hard about the *next* batch of experiments — synthesize lessons learned so far, form hypotheses, draft the next N ideas. Commit these to a provisional next-batch plan (just held in context). Once you've settled on the next batch, stop and wait for the current results.
+5. **Collect results**: When all sub-agents complete, collect all results. Identify every run that beats the current best val_bpb (there may be zero, one, or several).
+6. **Handle results**:
+   - **No improvements**: go to step 7 (log and discard all).
+   - **Exactly one improvement**: proceed to confirmation (step 8).
+   - **Multiple improvements**: run confirmation on the *best* one only (step 8). Promote the second-best idea to the front of the next batch — it will be tested (from the current HEAD, not the winner) in the next iteration, letting you check whether the two improvements stack.
+7. (No improvement path) Mark all as `discard`. Log to results.tsv. Skip to step 11.
+8. **Confirmation** (default on, can be disabled): Spawn up to 3 sub-agents in parallel, each re-running the **same commit** (no train.py changes) with a different random seed. Pass `seed=1`, `seed=2`, `seed=3` (see Sub-agent Protocol).
    - Collect all 3 confirmation val_bpb values. Compute the mean.
    - **If mean val_bpb < current best**: confirmation passed. Cherry-pick the winning commit. Mark original as `keep`, confirmation runs as `confirm-keep`.
-   - **If mean val_bpb ≥ current best**: confirmation failed — the original result was a lucky seed. Mark original as `discard`, confirmation runs as `confirm-discard`. Branch stays at current HEAD.
-   - Log all confirmation runs to `results.tsv` (same commit hash, different seeds noted in description).
-7. **If no improvement**: Mark all as `discard`. Branch stays at current HEAD.
-8. **Log all N results** to `results.tsv` (one row per experiment, including crashes).
-9. **After any `keep`**: push the branch and update `state.md`:
-   ```bash
-   git push origin HEAD || true
-   ```
-   Push failures are non-fatal — log a warning and continue. Then rewrite `state.md` (see **State file** section below). Commit `state.md` and attempt to push it too (`git push origin HEAD || true`). If push fails, the state is still preserved locally and will be pushed on the next successful push.
-10. **Reset worktrees**: Each worktree should be reset to the new HEAD before the next batch:
+   - **If mean val_bpb ≥ current best**: confirmation failed — lucky seed. Mark original as `discard`, confirmation runs as `confirm-discard`. Branch stays at current HEAD.
+   - **Re-evaluate next batch**: if confirmation passed, review the provisional next-batch plan (drafted in step 4) in light of the confirmed winner. Does the winner change what's worth trying? Adjust the next batch before proceeding.
+9. **Log all results** to `results.tsv` (one row per experiment and per confirmation run, including crashes). Fill in `analysis` and `lessons` for every non-confirmation row.
+10. **After any `keep`**: push the branch and update `state.md`:
+    ```bash
+    git push origin HEAD || true
+    ```
+    Push failures are non-fatal — log a warning and continue. Then rewrite `state.md` (see **State file** section below). Commit `state.md` and attempt to push it too (`git push origin HEAD || true`). If push fails, the state is still preserved locally and will be pushed on the next successful push.
+11. **Reset worktrees**: Each worktree should be reset to the new HEAD before the next batch:
     ```bash
     cd /tmp/autoresearch-gpu$i && git reset --hard <new_HEAD>
     ```
-11. **Loop back** to step 1 immediately. Never pause to ask the human.
+12. **Loop back** to step 1 immediately. Never pause to ask the human.
 
 **Confirmation runs** are enabled by default. To disable (e.g. during rapid early exploration or if GPU time is scarce), the human can say "skip confirmation" at session start. When disabled, step 6 reduces to: cherry-pick immediately on any improvement, mark as `keep`.
 
