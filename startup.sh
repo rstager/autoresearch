@@ -6,7 +6,7 @@
 set -euo pipefail
 
 REPO_NAME="${REPO_NAME:-autoresearch}"
-REPO_DIR="/workspace/$REPO_NAME"
+REPO_DIR="${REPO_DIR:-/workspace/home/coder/$REPO_NAME}"
 ENV_FILE="$REPO_DIR/.env"
 BASHRC="${HOME}/.bashrc"
 
@@ -145,13 +145,14 @@ PYTHON=$(command -v python3)
 echo "[startup] Using Python: $($PYTHON --version)"
 
 echo "[startup] Installing project dependencies..."
-sudo -E uv pip install --system --python "$PYTHON" "$REPO_DIR"
+UV=$(command -v uv)
+sudo -E "$UV" pip install --system --python "$PYTHON" "$REPO_DIR"
 
 # flash-attn is required by train.py but not in pyproject.toml (needs CUDA to build)
 if ! "$PYTHON" -c "import flash_attn" 2>/dev/null; then
     echo "[startup] Installing flash-attn (may take several minutes)..."
-    sudo -E uv pip install --system --python "$PYTHON" setuptools
-    sudo -E uv pip install --system --python "$PYTHON" flash-attn --no-build-isolation
+    sudo -E "$UV" pip install --system --python "$PYTHON" setuptools
+    sudo -E "$UV" pip install --system --python "$PYTHON" flash-attn --no-build-isolation
 fi
 
 # -----------------------------------------------------------------------------
