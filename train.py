@@ -43,6 +43,7 @@ class BlockConfig:
     n_in: int | None = None     # attn input width; None = n_embd; can be set wider for full context
     has_ve: bool = False
     window_size: tuple = (-1, 0)  # (-1, 0) = full context; (k, 0) = sliding window
+    enabled: bool = True          # if False, this block is skipped (identity pass-through)
 
 
 @dataclass
@@ -289,6 +290,8 @@ class GPT(nn.Module):
         x0 = x
         for i, block in enumerate(self.transformer.h):
             bc = self.block_configs[i]
+            if not bc.enabled:
+                continue
             n_embd = bc.n_embd
             n_in = bc.n_in if bc.n_in is not None else n_embd
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
