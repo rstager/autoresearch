@@ -14,12 +14,15 @@ To set up a new experiment, work with the user to:
    - `train.py` — the file you modify. Model architecture, optimizer, training loop.
 4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
 5. **Detect GPU count**: Run `nvidia-smi --query-gpu=name --format=csv,noheader` to see available GPUs. Note the count N.
-6. **Compute CPU ranges**: Divide all available CPUs evenly across the N GPU slots. This prevents parallel training processes from competing for the same cores.
+6. **Compute CPU ranges**: Reserve ~10% of CPUs (minimum 2) for general compute, then divide the remainder evenly across the N GPU slots. This prevents parallel training processes from competing for the same cores or starving the system.
    ```bash
    TOTAL_CPUS=$(nproc)
-   CPUS_PER_GPU=$((TOTAL_CPUS / N))
+   RESERVED=$(( TOTAL_CPUS / 10 ))
+   [ $RESERVED -lt 2 ] && RESERVED=2
+   AVAILABLE=$(( TOTAL_CPUS - RESERVED ))
+   CPUS_PER_GPU=$(( AVAILABLE / N ))
    # Slot i gets cores [i*CPUS_PER_GPU .. (i+1)*CPUS_PER_GPU - 1]
-   # e.g. 12 cores / 4 GPUs → gpu0: 0-2, gpu1: 3-5, gpu2: 6-8, gpu3: 9-11
+   # e.g. 128 total, 13 reserved → 115 available / 2 GPUs → gpu0: 0-57, gpu1: 58-114 (cores 115-127 reserved)
    ```
    Record these ranges (e.g. in a shell array or just note them) — each sub-agent will receive its range.
 7. **Create git worktrees**: One worktree per GPU, used for parallel experiments:
