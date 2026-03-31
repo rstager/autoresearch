@@ -8,7 +8,7 @@ set -euo pipefail
 REPO_NAME="${REPO_NAME:-autoresearch}"
 REPO_DIR="/workspace/$REPO_NAME"
 ENV_FILE="$REPO_DIR/.env"
-BASHRC="/root/.bashrc"
+BASHRC="${HOME}/.bashrc"
 
 echo "[startup] $(date)"
 
@@ -70,7 +70,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader \
 # -----------------------------------------------------------------------------
 # 5. Volume / disk check
 # -----------------------------------------------------------------------------
-for vol in /workspace /data /scratch; do
+for vol in /workspace "$HOME/data" "$HOME/scratch"; do
     if [ -d "$vol" ]; then
         echo "[startup] $vol: $(df -h "$vol" | tail -1 | awk '{print $4}') free"
     else
@@ -81,22 +81,22 @@ done
 # -----------------------------------------------------------------------------
 # 6. Standard directories
 # -----------------------------------------------------------------------------
-mkdir -p /data/datasets /data/checkpoints /data/logs /data/wandb /data/.cache/huggingface
-mkdir -p /scratch/tmp /scratch/compile
+mkdir -p ~/data/datasets ~/data/checkpoints ~/data/logs ~/data/wandb ~/data/.cache/huggingface
+mkdir -p ~/scratch/tmp ~/scratch/compile
 
 # -----------------------------------------------------------------------------
 # 7. Export standard paths
 # -----------------------------------------------------------------------------
-export HF_HOME="${HF_HOME:-/data/.cache/huggingface}"
-export WANDB_DIR="${WANDB_DIR:-/data/wandb}"
-export TMPDIR="${TMPDIR:-/scratch/tmp}"
+export HF_HOME="${HF_HOME:-$HOME/data/.cache/huggingface}"
+export WANDB_DIR="${WANDB_DIR:-$HOME/data/wandb}"
+export TMPDIR="${TMPDIR:-$HOME/scratch/tmp}"
 export PYTHONPATH="${PYTHONPATH:-$REPO_DIR}"
 
 # -----------------------------------------------------------------------------
 # 8. Install system utilities
 # -----------------------------------------------------------------------------
 echo "[startup] Installing system utilities..."
-apt-get update -qq && apt-get install -y -qq tmux vim
+sudo apt-get update -qq && sudo apt-get install -y -qq tmux vim
 
 # -----------------------------------------------------------------------------
 # 9. Configure git credentials from GITHUB_TOKEN env var
@@ -139,43 +139,37 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# 12. Install project dependencies into system Python
+# 12. Install project dependencies
 # -----------------------------------------------------------------------------
+PYTHON=$(command -v python3)
+echo "[startup] Using Python: $($PYTHON --version)"
+
 echo "[startup] Installing project dependencies..."
-uv pip install --system --python python3.11 \
-    $(python3.11 -c "import tomllib; deps=tomllib.load(open('$REPO_DIR/pyproject.toml','rb'))['project']['dependencies']; print(' '.join(deps))")
+sudo -E uv pip install --system --python "$PYTHON" "$REPO_DIR"
 
 # flash-attn is required by train.py but not in pyproject.toml (needs CUDA to build)
-if ! python3.11 -c "import flash_attn" 2>/dev/null; then
+if ! "$PYTHON" -c "import flash_attn" 2>/dev/null; then
     echo "[startup] Installing flash-attn (may take several minutes)..."
-    uv pip install --system --python python3.11 flash-attn --no-build-isolation
+    sudo -E uv pip install --system --python "$PYTHON" setuptools
+    sudo -E uv pip install --system --python "$PYTHON" flash-attn --no-build-isolation
 fi
 
 # -----------------------------------------------------------------------------
-# 13. Restore user configs (tmux) and symlink ~/.claude to /workspace
+# 13. Restore user configs (tmux)
 # -----------------------------------------------------------------------------
-cat > /root/.tmux.conf << 'EOF'
+cat > "${HOME}/.tmux.conf" << 'EOF'
 set -g mouse on
 set -g default-terminal "xterm-256color"
 EOF
 
-# Symlink ~/.claude to persistent storage so credentials, memory, settings survive
-mkdir -p /workspace/.claude
-if [ -d /root/.claude ] && [ ! -L /root/.claude ]; then
-    # First run after fresh root: merge any installer state into persistent dir
-    cp -a /root/.claude/. /workspace/.claude/ 2>/dev/null || true
-    rm -rf /root/.claude
-fi
-ln -sfn /workspace/.claude /root/.claude
-
 # -----------------------------------------------------------------------------
 # 14. DATA SETUP — download data if not already present
 # -----------------------------------------------------------------------------
-DATA_READY_FLAG="/data/datasets/.ready"
+DATA_READY_FLAG="$HOME/data/datasets/.ready"
 if [ ! -f "$DATA_READY_FLAG" ]; then
     echo "[startup] Downloading data (prepare.py)..."
     cd "$REPO_DIR"
-    python3.11 prepare.py
+    "$PYTHON" prepare.py
     touch "$DATA_READY_FLAG"
 else
     echo "[startup] Data already present, skipping download"
@@ -184,9 +178,9 @@ fi
 # -----------------------------------------------------------------------------
 # 15. Convenience symlinks into repo dir
 # -----------------------------------------------------------------------------
-ln -sfn /data/checkpoints "$REPO_DIR/checkpoints" 2>/dev/null || true
-ln -sfn /data/datasets    "$REPO_DIR/datasets"    2>/dev/null || true
-ln -sfn /data/logs        "$REPO_DIR/logs"        2>/dev/null || true
+ln -sfn ~/data/checkpoints "$REPO_DIR/checkpoints" 2>/dev/null || true
+ln -sfn ~/data/datasets    "$REPO_DIR/datasets"    2>/dev/null || true
+ln -sfn ~/data/logs        "$REPO_DIR/logs"        2>/dev/null || true
 
 # -----------------------------------------------------------------------------
 # 16. Ready — keep alive for interactive SSH use
