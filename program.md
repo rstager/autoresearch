@@ -13,27 +13,10 @@ To set up a new experiment, work with the user to:
    - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
    - `train.py` — the file you modify. Model architecture, optimizer, training loop.
 4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
-5. **Detect GPU count**: Run `nvidia-smi --query-gpu=name --format=csv,noheader` to see available GPUs. Note the count N.
-6. **Compute CPU ranges**: Reserve ~10% of CPUs (minimum 2) for general compute, then divide the remainder evenly across the N GPU slots. This prevents parallel training processes from competing for the same cores or starving the system.
-   ```bash
-   TOTAL_CPUS=$(nproc)
-   RESERVED=$(( TOTAL_CPUS / 10 ))
-   [ $RESERVED -lt 2 ] && RESERVED=2
-   AVAILABLE=$(( TOTAL_CPUS - RESERVED ))
-   CPUS_PER_GPU=$(( AVAILABLE / N ))
-   # Slot i gets cores [i*CPUS_PER_GPU .. (i+1)*CPUS_PER_GPU - 1]
-   # e.g. 128 total, 13 reserved → 115 available / 2 GPUs → gpu0: 0-57, gpu1: 58-114 (cores 115-127 reserved)
-   ```
-   Record these ranges (e.g. in a shell array or just note them) — each sub-agent will receive its range.
-7. **Create git worktrees**: One worktree per GPU, used for parallel experiments:
-   ```bash
-   for i in $(seq 0 $((N-1))); do
-     git worktree add /tmp/autoresearch-gpu$i HEAD
-   done
-   ```
-8. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first batch.
-9. **Initialize state.md**: Create an initial `state.md` with the session branch, date, hypothesis, and current baseline config. Commit and push it.
-10. **Confirm and go**: Confirm setup looks good.
+5. **Detect GPU count**: Run `nvidia-smi --query-gpu=index,name --format=csv,noheader` to see available GPUs. Note the count N — this determines how many experiments run per batch. GPU/CPU setup and worktree creation are handled by `run.md` when each batch is invoked.
+6. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first batch.
+7. **Initialize state.md**: Create an initial `state.md` with the session branch, date, hypothesis, and current baseline config. Commit and push it.
+8. **Confirm and go**: Confirm setup looks good.
 
 Once you get confirmation, kick off the experimentation.
 
@@ -146,14 +129,9 @@ c3d4e5f	1.005000	44.0	discard	narrow late: last 2 layers n_embd=256	Late layers 
 e5f6g7h	0.000000	0.0	crash	double n_model to 1024	OOM — 1024-dim residual stream exceeds VRAM at batch 128	n_model above 512 requires batch size reduction to fit VRAM
 ```
 
-## Model assignments
-
-- **Orchestrator** (the top-level Claude running this loop): use **Opus 4.6** (`claude-opus-4-6`). It handles strategic reasoning — interpreting results, generating hypotheses, deciding keep/discard, and synthesizing learnings across batches.
-- **Sub-agents** (one per GPU, executing a single experiment): use **Sonnet 4.6** (`claude-sonnet-4-6`). The task is mechanical — read train.py, make a targeted edit, run a command, return results. Sonnet is fully capable of this. Use **Haiku 4.5** (`claude-haiku-4-5-20251001`) if cost is a higher priority than edit quality.
-
-When spawning sub-agents, pass `model="sonnet"` (or `model="haiku"`) to the Agent tool.
-
 ## The experiment loop
+
+The orchestrator running this loop should use **Opus 4.6** (`claude-opus-4-6`) — it handles strategic reasoning: interpreting results, generating hypotheses, deciding keep/discard, and synthesizing learnings across batches.
 
 The experiment runs on a dedicated branch (e.g. `autoresearch/mar5`). The **main branch** (on the original repo checkout) is the source of truth. Worktrees are temporary workspaces.
 
@@ -161,13 +139,7 @@ LOOP FOREVER:
 
 1. **Review state**: Look at the current branch HEAD commit and `results.tsv`. Note the best val_bpb so far.
 2. **Generate N ideas**: Think hard. Come up with N diverse experiment hypotheses (N = number of GPUs). Make them meaningfully different — don't just vary one hyperparameter across all slots. Draw on the `lessons` column of results.tsv and the `state.md` next-directions to guide the choices.
-3. **Spawn N sub-agents in parallel**: Use the Agent tool with `run_in_background=True` and `model="sonnet"` (or `"haiku"`) for each GPU. Pass each sub-agent:
-   - Its GPU index (0, 1, …, N-1)
-   - Its CPU range (pre-computed in setup, e.g. `0-2` for slot 0)
-   - Its worktree path (`/tmp/autoresearch-gpu{i}`)
-   - The experiment idea description
-   - The current HEAD commit hash to base from
-   See the **Sub-agent Protocol** section below.
+3. **Run the batch**: invoke `run.md` with `BASE_COMMIT=<current HEAD>` and `TASKS=<the N ideas from step 2>`. See [run.md](run.md) for the full parallel execution protocol — GPU/CPU setup, worktree isolation, sub-agent dispatch, and per-task results collection.
 4. **Think while waiting**: While the sub-agents run (~5 min), use the time productively. Think hard about the *next* batch of experiments — synthesize lessons learned so far, form hypotheses, draft the next N ideas. Commit these to a provisional next-batch plan (just held in context). Once you've settled on the next batch, stop and wait for the current results.
 5. **Collect results**: When all sub-agents complete, collect all results. Identify every run that beats the current best val_bpb (there may be zero, one, or several).
 6. **Handle results**:
@@ -175,7 +147,7 @@ LOOP FOREVER:
    - **Exactly one improvement**: proceed to confirmation (step 8).
    - **Multiple improvements**: run confirmation on the *best* one only (step 8). Promote the second-best idea to the front of the next batch — it will be tested (from the current HEAD, not the winner) in the next iteration, letting you check whether the two improvements stack.
 7. (No improvement path) Mark all as `discard`. Log to results.tsv. Skip to step 11.
-8. **Confirmation** (default on, can be disabled): Spawn up to 3 sub-agents in parallel, each re-running the **same commit** (no train.py changes) with a different random seed. Pass `seed=1`, `seed=2`, `seed=3` (see Sub-agent Protocol).
+8. **Confirmation** (default on, can be disabled): Invoke `run.md` with the **same commit** as `BASE_COMMIT` and 3 tasks of the form `"re-run <IDEA> seed=1"`, `"re-run <IDEA> seed=2"`, `"re-run <IDEA> seed=3"`. Pass `SEED` to each sub-agent so it patches the seed before running without modifying the commit (see `run.md` sub-agent protocol). Use `model="sonnet"` for these re-runs since no code changes are involved.
    - Collect all 3 confirmation val_bpb values. Compute the mean.
    - **If mean val_bpb < current best**: confirmation passed. Cherry-pick the winning commit. Mark original as `keep`, confirmation runs as `confirm-keep`.
    - **If mean val_bpb ≥ current best**: confirmation failed — lucky seed. Mark original as `discard`, confirmation runs as `confirm-discard`. Branch stays at current HEAD.
@@ -241,42 +213,6 @@ Update this after each batch so it's always forward-looking.>
 
 **On resume**: Read `state.md` first. It tells you where you are, what's been learned, and what to try next. Then read `results.tsv` for the full numerical record. Then read the current `train.py` for the exact config.
 
-## Sub-agent Protocol
+## Parallel execution
 
-When invoked as a sub-agent to run a single experiment, follow these steps exactly:
-
-**Inputs you receive:**
-- `GPU_INDEX`: the physical GPU to use (0, 1, …)
-- `CPU_RANGE`: the CPU cores assigned to this slot (e.g. `0-2`), pre-computed during setup
-- `WORKTREE`: path to your isolated worktree (e.g. `/tmp/autoresearch-gpu0`)
-- `BASE_COMMIT`: the commit hash to base your experiment on
-- `IDEA`: description of the experiment to implement
-- `SEED` *(optional, confirmation runs only)*: integer seed to use instead of the default 42. When provided, temporarily patch `torch.manual_seed` and `torch.cuda.manual_seed` calls in train.py before running, then restore them after.
-
-**Steps:**
-1. `cd <WORKTREE>`
-2. `git reset --hard <BASE_COMMIT>` — ensure clean slate
-3. Read the current `train.py` to understand what to change
-4. Modify `train.py` to implement `<IDEA>`
-5. `git add train.py && git commit -m "<IDEA>"`
-6. Note the new commit hash: `git rev-parse --short HEAD`
-7. Run the experiment, pinned to the assigned CPU cores:
-   ```bash
-   taskset -c <CPU_RANGE> env CUDA_VISIBLE_DEVICES=<GPU_INDEX> uv run train.py > run.log 2>&1
-   ```
-   `taskset -c <CPU_RANGE>` restricts the entire process tree (including PyTorch workers) to the assigned cores, preventing interference with other GPU slots. Set a 10-minute wall-clock timeout. Kill and report crash if exceeded.
-8. Check results:
-   ```bash
-   grep "^val_bpb:\|^peak_vram_mb:" run.log
-   ```
-9. If grep output is empty → crash. Run `tail -n 50 run.log` to read the stack trace. Attempt a simple fix and re-run if the cause is obvious (typo, missing import). Otherwise report crash.
-10. **Return to orchestrator**:
-    ```
-    commit: <7-char hash>
-    val_bpb: <float>
-    peak_vram_mb: <float>
-    status: ok | crash
-    description: <IDEA>
-    ```
-
-The sub-agent does **not** update `results.tsv` or make decisions about keep/discard — that is the orchestrator's job.
+All parallel task dispatch, GPU/CPU isolation, worktree management, and sub-agent protocol is handled by [run.md](run.md). Refer to that document when invoking a batch of experiments or confirmation runs.
