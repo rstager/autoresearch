@@ -12,7 +12,7 @@ import gc
 import math
 import time
 from datetime import datetime
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
 
 import torch
 import torch.nn as nn
@@ -35,32 +35,11 @@ except ImportError:
 from flash_attn import flash_attn_func
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+from configs import BlockConfig, GPTConfig, get_config, CONFIGS
 
 # ---------------------------------------------------------------------------
 # GPT Model
 # ---------------------------------------------------------------------------
-
-@dataclass
-class BlockConfig:
-    n_head: int = 6
-    n_kv_head: int = 6
-    n_embd: int = 768           # block compute/output width; writes x[:, :, :n_embd]
-    n_in: int | None = None     # attn input width; None = n_embd; can be set wider for full context
-    has_ve: bool = False
-    window_size: tuple = (-1, 0)  # (-1, 0) = full context; (k, 0) = sliding window
-    enabled: bool = True          # if False, this block is skipped (identity pass-through)
-
-
-@dataclass
-class GPTConfig:
-    sequence_len: int = 2048
-    vocab_size: int = 32768
-    n_model: int = 512          # full residual stream width
-    blocks: list = field(default_factory=list)  # list[BlockConfig]
-
-    @property
-    def n_layer(self):
-        return len(self.blocks)
 
 
 def norm(x):
