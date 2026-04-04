@@ -18,6 +18,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 # CHANGED: replaced kernels-based flash attention loader with flash_attn package.
 # Original code was:
 #   from kernels import get_kernel
@@ -529,6 +534,31 @@ x, y, epoch = next(train_loader)  # prefetch first batch
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
 
+if wandb is not None:
+    try:
+        wandb.init(
+            project=os.environ.get("WANDB_PROJECT", "autoresearch"),
+            config={
+                **asdict(config),
+                "total_batch_size": TOTAL_BATCH_SIZE,
+                "device_batch_size": DEVICE_BATCH_SIZE,
+                "embedding_lr": EMBEDDING_LR,
+                "unembedding_lr": UNEMBEDDING_LR,
+                "matrix_lr": MATRIX_LR,
+                "scalar_lr": SCALAR_LR,
+                "weight_decay": WEIGHT_DECAY,
+                "adam_betas": ADAM_BETAS,
+                "warmup_ratio": WARMUP_RATIO,
+                "warmdown_ratio": WARMDOWN_RATIO,
+                "final_lr_frac": FINAL_LR_FRAC,
+                "num_params_M": num_params / 1e6,
+                "grad_accum_steps": grad_accum_steps,
+            },
+        )
+    except Exception as e:
+        print(f"wandb init failed (continuing without): {e}")
+        wandb = None
+
 # Schedules (all based on progress = training_time / TIME_BUDGET)
 
 def get_lr_multiplier(progress):
@@ -605,6 +635,15 @@ while True:
 
     print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
 
+    if wandb is not None and step > 10:
+        wandb.log({
+            "train/loss": debiased_smooth_loss,
+            "train/lr_multiplier": lrm,
+            "train/mfu_percent": mfu,
+            "train/tok_per_sec": tok_per_sec,
+            "train/progress_pct": pct_done,
+        }, step=step)
+
     # GC management (Python's GC causes ~500ms stalls)
     if step == 0:
         gc.collect()
@@ -644,6 +683,17 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {config.n_layer}")
+
+if wandb is not None:
+    wandb.log({
+        "eval/val_bpb": val_bpb,
+        "eval/peak_vram_mb": peak_vram_mb,
+        "eval/mfu_percent": steady_state_mfu,
+        "eval/total_tokens_M": total_tokens / 1e6,
+        "eval/num_steps": step,
+        "eval/training_seconds": total_training_time,
+    })
+    wandb.finish()
 
 # Save final checkpoint
 ckpt_dir = "/data/checkpoints"
