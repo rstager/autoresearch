@@ -52,6 +52,19 @@ class BlockConfig:
 
 
 @dataclass
+class DeltaNetConfig:
+    """Config for a DeltaNet linear-attention block (drop-in replacement for BlockConfig)."""
+    n_head: int = 4
+    n_embd: int = 512           # block compute/output width; writes x[:, :, :n_embd]
+    n_in: int | None = None     # input width; None = n_embd
+    expand_v: int = 2           # value head_dim multiplier (head_dim_v = expand_v * head_dim)
+    chunk_size: int = 64        # chunk size for parallel delta scan
+    has_ve: bool = False        # not used; present for interface compatibility
+    window_size: tuple = (-1, 0)  # not used; present for interface compatibility
+    enabled: bool = True
+
+
+@dataclass
 class GPTConfig:
     sequence_len: int = 2048
     vocab_size: int = 32768
@@ -144,6 +157,136 @@ class Block(nn.Module):
         return x
 
 
+# ---------------------------------------------------------------------------
+# DeltaNet linear attention
+# ---------------------------------------------------------------------------
+
+def _delta_scan_chunk(q, k, v, beta, chunk_size):
+    """
+    Parallel delta-rule scan over one chunk.
+
+    Args:
+        q, k : [B, h, C, d]     (C = chunk_size, d = head_dim)
+        v    : [B, h, C, d_v]   (d_v = expand_v * d)
+        beta : [B, h, C, 1]     scalar forget gate per position
+
+    Returns:
+        o    : [B, h, C, d_v]   output for this chunk
+        S    : [B, h, d, d_v]   updated state at end of chunk
+    """
+    B, h, C, d = q.shape
+    d_v = v.shape[-1]
+    dtype = q.dtype
+    S = torch.zeros(B, h, d, d_v, device=q.device, dtype=torch.float32)
+
+    # Sequential loop within the chunk (C is small, typically 64).
+    # Each step: S = (1-beta)*S + beta*(k_t^T @ v_t)
+    #            o_t = q_t @ S
+    outputs = []
+    for t in range(C):
+        kt = k[:, :, t, :].unsqueeze(-1).float()   # [B,h,d,1]
+        vt = v[:, :, t, :].unsqueeze(-2).float()   # [B,h,1,d_v]
+        bt = beta[:, :, t, :].float()              # [B,h,1]
+        S = (1.0 - bt.unsqueeze(-1)) * S + bt.unsqueeze(-1) * (kt * vt)
+        qt = q[:, :, t, :].unsqueeze(-2).float()   # [B,h,1,d]
+        ot = (qt @ S).squeeze(-2)                  # [B,h,d_v]
+        outputs.append(ot)
+    o = torch.stack(outputs, dim=2).to(dtype)      # [B,h,C,d_v]
+    return o, S
+
+
+class DeltaNetAttention(nn.Module):
+    """
+    DeltaNet: causal linear attention with per-step delta update rule.
+
+    State update:  S_t = (1 - beta_t) * S_{t-1} + beta_t * (k_t ⊗ v_t)
+    Output:        o_t = q_t @ S_t
+
+    Uses chunked parallel scan for training efficiency.
+    Reference: Schlag et al. 2021 "Linear Transformers Are Secretly Fast Weight Programmers"
+               + DeltaNet (Yang et al. 2024)
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        assert isinstance(config, DeltaNetConfig)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.chunk_size = config.chunk_size
+        n_in = config.n_in if config.n_in is not None else config.n_embd
+        self.head_dim = config.n_embd // config.n_head
+        self.head_dim_v = self.head_dim * config.expand_v
+        assert config.n_embd % config.n_head == 0
+
+        self.c_q    = nn.Linear(n_in, self.n_head * self.head_dim, bias=False)
+        self.c_k    = nn.Linear(n_in, self.n_head * self.head_dim, bias=False)
+        self.c_v    = nn.Linear(n_in, self.n_head * self.head_dim_v, bias=False)
+        self.c_beta = nn.Linear(n_in, self.n_head, bias=False)
+        self.c_proj = nn.Linear(self.n_head * self.head_dim_v, self.n_embd, bias=False)
+
+    def forward(self, x, ve, cos_sin, window_size):
+        # ve and window_size are unused — present for interface compatibility
+        B, T, _ = x.shape
+        C = self.chunk_size
+        assert T % C == 0, f"Sequence length {T} must be divisible by chunk_size {C}"
+        n_chunks = T // C
+
+        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+        k = self.c_k(x).view(B, T, self.n_head, self.head_dim)
+        v = self.c_v(x).view(B, T, self.n_head, self.head_dim_v)
+
+        # Normalise q, k (same as standard attention path)
+        q, k = norm(q), norm(k)
+
+        # beta: per-head forget gate in (0,1)
+        beta = torch.sigmoid(self.c_beta(x))  # [B, T, n_head]
+        beta = beta.unsqueeze(-1)              # [B, T, n_head, 1]
+
+        # Reshape to [B, h, n_chunks, C, d]
+        q    = q.permute(0, 2, 1, 3).reshape(B, self.n_head, n_chunks, C, self.head_dim)
+        k    = k.permute(0, 2, 1, 3).reshape(B, self.n_head, n_chunks, C, self.head_dim)
+        v    = v.permute(0, 2, 1, 3).reshape(B, self.n_head, n_chunks, C, self.head_dim_v)
+        beta = beta.permute(0, 2, 1, 3).reshape(B, self.n_head, n_chunks, C, 1)
+
+        # Process chunks sequentially (state S carried across chunks)
+        all_outputs = []
+        S = torch.zeros(B, self.n_head, self.head_dim, self.head_dim_v,
+                        device=x.device, dtype=x.dtype)
+        for ci in range(n_chunks):
+            o_chunk, S = _delta_scan_chunk(
+                q[:, :, ci], k[:, :, ci], v[:, :, ci], beta[:, :, ci], C
+            )
+            S = S.to(x.dtype)
+            all_outputs.append(o_chunk)  # [B, h, C, d_v]
+
+        # [B, h, T, d_v] -> [B, T, h*d_v]
+        out = torch.cat(all_outputs, dim=2)
+        out = out.permute(0, 2, 1, 3).reshape(B, T, self.n_head * self.head_dim_v)
+        return self.c_proj(out)
+
+
+class DeltaNetBlock(nn.Module):
+    """DeltaNet block — same external interface as Block."""
+
+    def __init__(self, config):
+        super().__init__()
+        assert isinstance(config, DeltaNetConfig)
+        self.attn = DeltaNetAttention(config)
+        self.mlp = MLP(config)
+
+    def forward(self, x, x_wide, ve, cos_sin, window_size):
+        x = x + self.attn(norm(x_wide), ve, cos_sin, window_size)
+        x = x + self.mlp(norm(x))
+        return x
+
+
+def make_block(config):
+    """Factory: return the right block class for the given config type."""
+    if isinstance(config, DeltaNetConfig):
+        return DeltaNetBlock(config)
+    return Block(config)
+
+
 class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -152,24 +295,29 @@ class GPT(nn.Module):
         self.window_sizes = [bc.window_size for bc in self.block_configs]
         bc0 = self.block_configs[0]
         bc_last = self.block_configs[-1]
-        head_dim = max(bc.n_embd // bc.n_head for bc in self.block_configs)
+        sa_configs = [bc for bc in self.block_configs if not isinstance(bc, DeltaNetConfig)]
+        head_dim = max(bc.n_embd // bc.n_head for bc in sa_configs) if sa_configs else 0
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(config.vocab_size, bc0.n_embd),
-            "h": nn.ModuleList([Block(bc) for bc in self.block_configs]),
+            "h": nn.ModuleList([make_block(bc) for bc in self.block_configs]),
         })
         pad_size = config.n_model - bc0.n_embd
         self.wte_pad = nn.Parameter(torch.zeros(pad_size)) if pad_size > 0 else None
         self.lm_head = nn.Linear(bc_last.n_embd, config.vocab_size, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
-        # Value embeddings (kv_dim is per-block)
+        # Value embeddings (kv_dim is per-block; DeltaNetConfig blocks don't support has_ve)
         self.value_embeds = nn.ModuleDict({
             str(i): nn.Embedding(config.vocab_size, bc.n_kv_head * (bc.n_embd // bc.n_head))
-            for i, bc in enumerate(self.block_configs) if bc.has_ve
+            for i, bc in enumerate(self.block_configs)
+            if bc.has_ve and not isinstance(bc, DeltaNetConfig)
         })
-        # Rotary embeddings
+        # Rotary embeddings (only needed for standard attention blocks)
         self.rotary_seq_len = config.sequence_len * 10
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        if head_dim > 0:
+            cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        else:
+            cos = sin = torch.zeros(1)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
@@ -185,6 +333,8 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
+            if isinstance(bc, DeltaNetConfig):
+                torch.nn.init.zeros_(block.attn.c_beta.weight)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
         # Per-layer scalars
@@ -195,12 +345,14 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(ve.weight, -s, s)
         # Gate weights init to zero (sigmoid(0)=0.5, scaled by 2 -> 1.0 = neutral)
         for block in self.transformer.h:
-            if block.attn.ve_gate is not None:
+            if isinstance(block, Block) and block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
-        # Rotary embeddings
-        head_dim = max(bc.n_embd // bc.n_head for bc in self.block_configs)
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
-        self.cos, self.sin = cos, sin
+        # Rotary embeddings (only for standard attention blocks)
+        sa_configs = [bc for bc in self.block_configs if not isinstance(bc, DeltaNetConfig)]
+        if sa_configs:
+            head_dim = max(bc.n_embd // bc.n_head for bc in sa_configs)
+            cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+            self.cos, self.sin = cos, sin
         # Cast embeddings to bf16
         self.transformer.wte.to(dtype=torch.bfloat16)
         for ve in self.value_embeds.values():
@@ -230,9 +382,13 @@ class GPT(nn.Module):
         for bc, window_size in zip(self.block_configs, self.window_sizes):
             h = bc.n_head
             q = bc.n_embd // bc.n_head
-            window = window_size[0]
-            effective_seq = t if window < 0 else min(window, t)
-            attn_flops += 12 * h * q * effective_seq
+            if isinstance(bc, DeltaNetConfig):
+                # Linear attention: O(T * d^2) per head, no quadratic term
+                attn_flops += 4 * h * q * q * t  # approx for state ops
+            else:
+                window = window_size[0]
+                effective_seq = t if window < 0 else min(window, t)
+                attn_flops += 12 * h * q * effective_seq
         return 6 * (nparams - nparams_exclude) + attn_flops
 
     def num_scaling_params(self):
@@ -488,6 +644,10 @@ tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
 print(f"Vocab size: {vocab_size:,}")
 
+# DeltaNet early layers (linear attention, simulates fast-weight memory)
+DN  = DeltaNetConfig(n_head=4, n_embd=512, expand_v=2, chunk_size=64)
+
+# Standard attention layers
 S   = BlockConfig(n_head=4, n_kv_head=4, n_embd=512, has_ve=False, window_size=(1024, 0))
 SVE = BlockConfig(n_head=4, n_kv_head=4, n_embd=512, has_ve=True,  window_size=(1024, 0))
 LVE = BlockConfig(n_head=4, n_kv_head=4, n_embd=512, has_ve=True,  window_size=(2048, 0))
@@ -496,7 +656,9 @@ config = GPTConfig(
     sequence_len=MAX_SEQ_LEN,
     vocab_size=vocab_size,
     n_model=512,
-    blocks=[S, SVE, S, LVE, S, SVE, S, LVE],
+    # First 2 layers: DeltaNet (linear attention, O(T) memory, good for early feature extraction)
+    # Remaining 6 layers: standard attention (as in hetero_layers baseline)
+    blocks=[DN, DN, S, LVE, S, SVE, S, LVE],
 )
 print(f"Model config: {asdict(config)}")
 
