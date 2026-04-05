@@ -1,7 +1,8 @@
 #!/bin/bash
 # =============================================================================
-# startup.sh — Lives in the repo at /workspace/autoresearch/startup.sh
-# Called by entrypoint.sh after clone/pull.
+# startup.sh — project-specific startup for autoresearch
+# Universal setup (Claude, tmux, uv, git) is handled by entrypoint.sh.
+# This script handles project-specific deps and data only.
 # =============================================================================
 set -euo pipefail
 
@@ -23,123 +24,22 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# 2. Patch .bashrc so .env is set in every shell
-# -----------------------------------------------------------------------------
-BASHRC_MARKER="# cloud: auto-source project .env"
-if ! grep -qF "$BASHRC_MARKER" "$BASHRC" 2>/dev/null; then
-    echo "[startup] Patching $BASHRC"
-    cat >> "$BASHRC" << BASHEOF
-
-$BASHRC_MARKER
-if [ -f "$ENV_FILE" ]; then
-    set -a; source "$ENV_FILE"; set +a
-fi
-BASHEOF
-fi
-
-# -----------------------------------------------------------------------------
-# 3. Install Claude Code if not already installed
-# -----------------------------------------------------------------------------
-CLAUDE_BASHRC_MARKER="# cloud: claude-code PATH"
-if ! command -v claude &>/dev/null; then
-    echo "[startup] Installing Claude Code..."
-    curl -fsSL https://claude.ai/install.sh | bash
-fi
-if ! grep -qF "$CLAUDE_BASHRC_MARKER" "$BASHRC" 2>/dev/null; then
-    echo "[startup] Adding Claude Code to PATH in $BASHRC"
-    cat >> "$BASHRC" << BASHEOF
-
-$CLAUDE_BASHRC_MARKER
-export PATH="\$HOME/.claude/bin:\$PATH"
-BASHEOF
-fi
-export PATH="$HOME/.claude/bin:$PATH"
-if command -v claude &>/dev/null; then
-    echo "[startup] Claude Code ready: $(claude --version 2>/dev/null || true)"
-else
-    echo "[startup] WARNING: claude binary not found after install"
-fi
-
-# -----------------------------------------------------------------------------
-# 4. GPU check
-# -----------------------------------------------------------------------------
-echo "[startup] GPU:"
-nvidia-smi --query-gpu=name,memory.total --format=csv,noheader \
-    || echo "[startup] WARNING: nvidia-smi failed"
-
-# -----------------------------------------------------------------------------
-# 5. Volume / disk check
-# -----------------------------------------------------------------------------
-for vol in /workspace "$HOME/data" "$HOME/scratch"; do
-    if [ -d "$vol" ]; then
-        echo "[startup] $vol: $(df -h "$vol" | tail -1 | awk '{print $4}') free"
-    else
-        echo "[startup] WARNING: $vol not available"
-    fi
-done
-
-# -----------------------------------------------------------------------------
-# 6. Standard directories
+# 2. Standard directories
 # -----------------------------------------------------------------------------
 mkdir -p ~/data/datasets ~/data/checkpoints ~/data/logs ~/data/wandb ~/data/.cache/huggingface
 mkdir -p ~/scratch/tmp ~/scratch/compile
 
 # -----------------------------------------------------------------------------
-# 7. Export standard paths
+# 3. Export standard paths
 # -----------------------------------------------------------------------------
 export HF_HOME="${HF_HOME:-$HOME/data/.cache/huggingface}"
 export WANDB_DIR="${WANDB_DIR:-$HOME/data/wandb}"
 export TMPDIR="${TMPDIR:-$HOME/scratch/tmp}"
 export PYTHONPATH="${PYTHONPATH:-$REPO_DIR}"
+export PATH="$HOME/.claude/bin:$HOME/.local/bin:$PATH"
 
 # -----------------------------------------------------------------------------
-# 8. Install system utilities
-# -----------------------------------------------------------------------------
-echo "[startup] Installing system utilities..."
-sudo apt-get update -qq && sudo apt-get install -y -qq tmux vim
-
-# -----------------------------------------------------------------------------
-# 9. Configure git credentials from GITHUB_TOKEN env var
-# -----------------------------------------------------------------------------
-if [ -n "${GITHUB_TOKEN:-}" ]; then
-    echo "[startup] Configuring git credentials from GITHUB_TOKEN"
-    git config --global credential.helper store
-    echo "https://x-token:${GITHUB_TOKEN}@github.com" > ~/.git-credentials
-else
-    echo "[startup] NOTE: GITHUB_TOKEN not set — git push will require manual auth"
-fi
-
-# -----------------------------------------------------------------------------
-# 10. Configure git user identity
-# -----------------------------------------------------------------------------
-git config --global user.name "${GIT_USER_NAME:-Roger}"
-git config --global user.email "${GIT_USER_EMAIL:-rkstager@gmail.com}"
-
-# -----------------------------------------------------------------------------
-# 11. Install uv if not already installed
-# -----------------------------------------------------------------------------
-UV_BASHRC_MARKER="# cloud: uv PATH"
-if ! command -v uv &>/dev/null; then
-    echo "[startup] Installing uv..."
-    curl -fsSL https://astral.sh/uv/install.sh | sh
-fi
-if ! grep -qF "$UV_BASHRC_MARKER" "$BASHRC" 2>/dev/null; then
-    echo "[startup] Adding uv to PATH in $BASHRC"
-    cat >> "$BASHRC" << BASHEOF
-
-$UV_BASHRC_MARKER
-export PATH="\$HOME/.local/bin:\$PATH"
-BASHEOF
-fi
-export PATH="$HOME/.local/bin:$PATH"
-if command -v uv &>/dev/null; then
-    echo "[startup] uv ready: $(uv --version)"
-else
-    echo "[startup] WARNING: uv binary not found after install"
-fi
-
-# -----------------------------------------------------------------------------
-# 12. Install project dependencies
+# 4. Install project dependencies
 # -----------------------------------------------------------------------------
 PYTHON=$(command -v python3)
 echo "[startup] Using Python: $($PYTHON --version)"
@@ -156,15 +56,7 @@ if ! "$PYTHON" -c "import flash_attn" 2>/dev/null; then
 fi
 
 # -----------------------------------------------------------------------------
-# 13. Restore user configs (tmux)
-# -----------------------------------------------------------------------------
-cat > "${HOME}/.tmux.conf" << 'EOF'
-set -g mouse on
-set -g default-terminal "xterm-256color"
-EOF
-
-# -----------------------------------------------------------------------------
-# 14. DATA SETUP — download data if not already present
+# 5. DATA SETUP — download data if not already present
 # -----------------------------------------------------------------------------
 DATA_READY_FLAG="$HOME/data/datasets/.ready"
 if [ ! -f "$DATA_READY_FLAG" ]; then
@@ -177,15 +69,11 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# 15. Convenience symlinks into repo dir
+# 6. Convenience symlinks into repo dir
 # -----------------------------------------------------------------------------
 ln -sfn ~/data/checkpoints "$REPO_DIR/checkpoints" 2>/dev/null || true
 ln -sfn ~/data/datasets    "$REPO_DIR/datasets"    2>/dev/null || true
 ln -sfn ~/data/logs        "$REPO_DIR/logs"        2>/dev/null || true
 
-# -----------------------------------------------------------------------------
-# 16. Ready — keep alive for interactive SSH use
-#    To auto-start training: replace with: exec uv run train.py
-# -----------------------------------------------------------------------------
 echo "[startup] Ready — repo at $REPO_DIR"
 cd "$REPO_DIR"
