@@ -455,6 +455,80 @@ class MuonAdamW(torch.optim.Optimizer):
                 self._step_muon(group)
 
 # ---------------------------------------------------------------------------
+# Staged layer training
+# ---------------------------------------------------------------------------
+
+def build_stage_schedule(n_layer):
+    """
+    Build the staged training schedule for n_layer transformer blocks.
+
+    Strategy: train from the outside in, two layers at a time from each end.
+    For n_layer=8, layers are [0,1,2,3,4,5,6,7]:
+
+      Stage 0: full_lr=[0,1,6,7]  reduced_lr=[]       frozen=[2,3,4,5]
+      Stage 1: full_lr=[2,5]      reduced_lr=[1,6]    frozen=[0,7,3,4]
+      Stage 2: full_lr=[3,4]      reduced_lr=[2,5]    frozen=[0,1,6,7]
+
+    Each stage gets an equal share of TIME_BUDGET.
+    Returns list of dicts: [{full_lr, reduced_lr, frozen, time_budget}, ...]
+    """
+    half = n_layer // 2
+    n_stages = half  # pairs: (0,n-1), (1,n-2), ..., (half-1, half)
+    time_per_stage = TIME_BUDGET / n_stages
+
+    stages = []
+    for s in range(n_stages):
+        # Layers being introduced this stage (outermost first)
+        outer = list(range(s, -1, -1)) + list(range(n_layer - 1, n_layer - 1 - s - 1, -1))
+        outer = sorted(set(outer))
+
+        # Newly active this stage
+        new_outer = [s, n_layer - 1 - s]
+
+        # Previously trained (now boundary — reduced LR)
+        prev_outer = [i for i in outer if i not in new_outer]
+
+        # Everything inside — not yet trained
+        inner = [i for i in range(n_layer) if i not in outer]
+
+        stages.append({
+            "full_lr":     sorted(new_outer),
+            "reduced_lr":  sorted(prev_outer),
+            "frozen":      sorted(inner),
+            "time_budget": time_per_stage,
+        })
+    return stages
+
+
+# LR multiplier for boundary (previously trained) layers
+STAGED_BOUNDARY_LR_SCALE = 0.1
+
+
+def apply_staged_grad_mask(model_orig, stage_info, param_to_layer):
+    """
+    Zero gradients for frozen layers.
+    Reduce effective gradient for boundary (reduced_lr) layers.
+    Call after loss.backward() and before optimizer.step().
+    """
+    frozen_set  = set(stage_info["frozen"])
+    reduced_set = set(stage_info["reduced_lr"])
+    for param_id, layer_idx in param_to_layer.items():
+        # param_id -> actual param object stored separately
+        pass  # handled inline in training loop via param_to_layer_map
+
+
+def build_param_to_layer(model_orig):
+    """
+    Returns dict mapping param data_ptr -> layer_index (or None for non-block params).
+    """
+    mapping = {}
+    for i, block in enumerate(model_orig.transformer.h):
+        for p in block.parameters():
+            mapping[p.data_ptr()] = i
+    return mapping
+
+
+# ---------------------------------------------------------------------------
 # Hyperparameters (edit these directly, no CLI flags needed)
 # ---------------------------------------------------------------------------
 
@@ -526,6 +600,14 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
+# Build staged schedule before compiling (needs original model)
+stage_schedule = build_stage_schedule(config.n_layer)
+param_to_layer = build_param_to_layer(model)  # data_ptr -> layer idx
+
+print(f"Staged training: {len(stage_schedule)} stages")
+for i, s in enumerate(stage_schedule):
+    print(f"  Stage {i}: full_lr={s['full_lr']} reduced_lr={s['reduced_lr']} frozen={s['frozen']} budget={s['time_budget']:.0f}s")
+
 model = torch.compile(model, dynamic=False)
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
@@ -578,13 +660,20 @@ def get_weight_decay(progress):
     return WEIGHT_DECAY * (1 - progress)
 
 # ---------------------------------------------------------------------------
-# Training loop
+# Training loop — staged layer training
 # ---------------------------------------------------------------------------
 
 t_start_training = time.time()
 smooth_train_loss = 0
-total_training_time = 0
+total_training_time = 0   # total wall time across all stages (excludes warmup steps)
+stage_training_time = 0   # wall time within current stage
 step = 0
+current_stage = 0
+stage_info = stage_schedule[current_stage]
+frozen_set  = set(stage_info["frozen"])
+reduced_set = set(stage_info["reduced_lr"])
+
+print(f"\n=== Stage 0: full_lr={stage_info['full_lr']} reduced_lr={stage_info['reduced_lr']} frozen={stage_info['frozen']} ===")
 
 while True:
     torch.cuda.synchronize()
@@ -597,11 +686,28 @@ while True:
         loss.backward()
         x, y, epoch = next(train_loader)
 
-    # Progress and schedules
-    progress = min(total_training_time / TIME_BUDGET, 1.0)
-    lrm = get_lr_multiplier(progress)
+    # Zero gradients for frozen layers, scale down gradients for boundary layers
+    # Must access original (uncompiled) model params via param_to_layer
+    for group in optimizer.param_groups:
+        for p in group['params']:
+            if p.grad is None:
+                continue
+            layer_idx = param_to_layer.get(p.data_ptr(), None)
+            if layer_idx is None:
+                continue  # embedding / lm_head / scalars — always train
+            if layer_idx in frozen_set:
+                p.grad = None
+            elif layer_idx in reduced_set:
+                p.grad.mul_(STAGED_BOUNDARY_LR_SCALE)
+
+    # Progress within current stage (for LR schedule)
+    stage_progress = min(stage_training_time / stage_info["time_budget"], 1.0)
+    # Global progress for logging
+    global_progress = min(total_training_time / TIME_BUDGET, 1.0)
+
+    lrm = get_lr_multiplier(stage_progress)
     muon_momentum = get_muon_momentum(step)
-    muon_weight_decay = get_weight_decay(progress)
+    muon_weight_decay = get_weight_decay(stage_progress)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
         if group['kind'] == 'muon':
@@ -623,17 +729,18 @@ while True:
 
     if step > 10:
         total_training_time += dt
+        stage_training_time += dt
 
     # Logging
     ema_beta = 0.9
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
-    pct_done = 100 * progress
+    pct_done = 100 * global_progress
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
     mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
     remaining = max(0, TIME_BUDGET - total_training_time)
 
-    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+    print(f"\rstep {step:05d} stg{current_stage} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | remaining: {remaining:.0f}s    ", end="", flush=True)
 
     if wandb is not None and step > 10:
         wandb.log({
@@ -642,6 +749,7 @@ while True:
             "train/mfu_percent": mfu,
             "train/tok_per_sec": tok_per_sec,
             "train/progress_pct": pct_done,
+            "train/stage": current_stage,
         }, step=step)
 
     # GC management (Python's GC causes ~500ms stalls)
@@ -653,6 +761,20 @@ while True:
         gc.collect()
 
     step += 1
+
+    # Check for stage transition
+    next_stage = current_stage + 1
+    if (step > 10
+            and stage_training_time >= stage_info["time_budget"]
+            and next_stage < len(stage_schedule)):
+        print(f"\n=== Stage {next_stage}: full_lr={stage_schedule[next_stage]['full_lr']} "
+              f"reduced_lr={stage_schedule[next_stage]['reduced_lr']} "
+              f"frozen={stage_schedule[next_stage]['frozen']} ===")
+        current_stage = next_stage
+        stage_info = stage_schedule[current_stage]
+        frozen_set  = set(stage_info["frozen"])
+        reduced_set = set(stage_info["reduced_lr"])
+        stage_training_time = 0   # reset stage clock
 
     # Time's up — but only stop after warmup steps so we don't count compilation
     if step > 10 and total_training_time >= TIME_BUDGET:
