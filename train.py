@@ -458,7 +458,7 @@ class MuonAdamW(torch.optim.Optimizer):
 # Staged layer training
 # ---------------------------------------------------------------------------
 
-def build_stage_schedule(n_layer):
+def build_stage_schedule(n_layer, num_params):
     """
     Build the staged training schedule for n_layer transformer blocks.
 
@@ -469,12 +469,14 @@ def build_stage_schedule(n_layer):
       Stage 1: full_lr=[2,5]      reduced_lr=[1,6]    frozen=[0,7,3,4]
       Stage 2: full_lr=[3,4]      reduced_lr=[2,5]    frozen=[0,1,6,7]
 
-    Each stage gets an equal share of TIME_BUDGET.
-    Returns list of dicts: [{full_lr, reduced_lr, frozen, time_budget}, ...]
+    Total token budget = Chinchilla-optimal 20 * num_params.
+    Each stage gets an equal share of that token budget.
+    Returns list of dicts: [{full_lr, reduced_lr, frozen, token_budget}, ...]
     """
     half = n_layer // 2
     n_stages = half  # pairs: (0,n-1), (1,n-2), ..., (half-1, half)
-    time_per_stage = TIME_BUDGET / n_stages
+    total_tokens = 20 * num_params
+    tokens_per_stage = total_tokens // n_stages
 
     stages = []
     for s in range(n_stages):
@@ -492,10 +494,10 @@ def build_stage_schedule(n_layer):
         inner = [i for i in range(n_layer) if i not in outer]
 
         stages.append({
-            "full_lr":     sorted(new_outer),
-            "reduced_lr":  sorted(prev_outer),
-            "frozen":      sorted(inner),
-            "time_budget": time_per_stage,
+            "full_lr":      sorted(new_outer),
+            "reduced_lr":   sorted(prev_outer),
+            "frozen":       sorted(inner),
+            "token_budget": tokens_per_stage,
         })
     return stages
 
@@ -604,12 +606,14 @@ optimizer = model.setup_optimizer(
 )
 
 # Build staged schedule before compiling (needs original model param references)
-stage_schedule = build_stage_schedule(config.n_layer)
+stage_schedule = build_stage_schedule(config.n_layer, num_params)
 layer_params = build_layer_params(model)  # layer_params[i] = list of params in block i
 
+chinchilla_tokens = 20 * num_params
+print(f"Chinchilla-optimal tokens: {chinchilla_tokens / 1e9:.2f}B ({chinchilla_tokens:,})")
 print(f"Staged training: {len(stage_schedule)} stages")
 for i, s in enumerate(stage_schedule):
-    print(f"  Stage {i}: full_lr={s['full_lr']} reduced_lr={s['reduced_lr']} frozen={s['frozen']} budget={s['time_budget']:.0f}s")
+    print(f"  Stage {i}: full_lr={s['full_lr']} reduced_lr={s['reduced_lr']} frozen={s['frozen']} budget={s['token_budget']/1e6:.0f}M tok")
 
 # Apply initial requires_grad=False for frozen layers (stage 0)
 set_layer_requires_grad(layer_params, stage_schedule[0]["frozen"], requires_grad=False)
@@ -619,7 +623,7 @@ model = torch.compile(model, dynamic=False)
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
 
-print(f"Time budget: {TIME_BUDGET}s")
+print(f"Time budget: {TIME_BUDGET}s  (token budget: {chinchilla_tokens/1e9:.2f}B tokens)")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
 
 if wandb is not None:
@@ -672,7 +676,8 @@ def get_weight_decay(progress):
 t_start_training = time.time()
 smooth_train_loss = 0
 total_training_time = 0   # total wall time across all stages (excludes warmup steps)
-stage_training_time = 0   # wall time within current stage
+total_tokens_trained = 0  # tokens seen so far (excludes warmup steps)
+stage_tokens = 0          # tokens processed in current stage
 step = 0
 current_stage = 0
 stage_info = stage_schedule[current_stage]
@@ -699,9 +704,7 @@ while True:
                 p.grad.mul_(STAGED_BOUNDARY_LR_SCALE)
 
     # Progress within current stage (for LR schedule)
-    stage_progress = min(stage_training_time / stage_info["time_budget"], 1.0)
-    # Global progress for logging
-    global_progress = min(total_training_time / TIME_BUDGET, 1.0)
+    stage_progress = min(stage_tokens / stage_info["token_budget"], 1.0)
 
     lrm = get_lr_multiplier(stage_progress)
     muon_momentum = get_muon_momentum(step)
@@ -727,16 +730,19 @@ while True:
 
     if step > 10:
         total_training_time += dt
-        stage_training_time += dt
+        total_tokens_trained += TOTAL_BATCH_SIZE
+        stage_tokens += TOTAL_BATCH_SIZE
 
     # Logging
     ema_beta = 0.9
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
+    global_progress = min(total_tokens_trained / chinchilla_tokens, 1.0)
     pct_done = 100 * global_progress
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
     mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
-    remaining = max(0, TIME_BUDGET - total_training_time)
+    remaining_tokens = max(0, chinchilla_tokens - total_tokens_trained)
+    remaining = remaining_tokens / tok_per_sec if tok_per_sec > 0 else 0
 
     print(f"\rstep {step:05d} stg{current_stage} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | remaining: {remaining:.0f}s    ", end="", flush=True)
 
@@ -763,7 +769,7 @@ while True:
     # Check for stage transition
     next_stage = current_stage + 1
     if (step > 10
-            and stage_training_time >= stage_info["time_budget"]
+            and stage_tokens >= stage_info["token_budget"]
             and next_stage < len(stage_schedule)):
         next_info = stage_schedule[next_stage]
         print(f"\n=== Stage {next_stage}: full_lr={next_info['full_lr']} "
@@ -783,15 +789,15 @@ while True:
         stage_info = next_info
         frozen_set  = set(stage_info["frozen"])
         reduced_set = set(stage_info["reduced_lr"])
-        stage_training_time = 0   # reset stage clock
+        stage_tokens = 0   # reset stage token counter
 
-    # Time's up — but only stop after warmup steps so we don't count compilation
-    if step > 10 and total_training_time >= TIME_BUDGET:
+    # Token budget exhausted — only stop after warmup steps
+    if step > 10 and total_tokens_trained >= chinchilla_tokens:
         break
 
 print()  # newline after \r training log
 
-total_tokens = step * TOTAL_BATCH_SIZE
+total_tokens = total_tokens_trained
 
 # Final eval
 model.eval()
