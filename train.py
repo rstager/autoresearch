@@ -504,28 +504,31 @@ def build_stage_schedule(n_layer):
 STAGED_BOUNDARY_LR_SCALE = 0.1
 
 
-def apply_staged_grad_mask(model_orig, stage_info, param_to_layer):
+def build_layer_params(model_orig):
     """
-    Zero gradients for frozen layers.
-    Reduce effective gradient for boundary (reduced_lr) layers.
-    Call after loss.backward() and before optimizer.step().
+    Returns list of lists: layer_params[i] = list of params in block i.
+    Built before torch.compile so we have direct param references.
     """
-    frozen_set  = set(stage_info["frozen"])
-    reduced_set = set(stage_info["reduced_lr"])
-    for param_id, layer_idx in param_to_layer.items():
-        # param_id -> actual param object stored separately
-        pass  # handled inline in training loop via param_to_layer_map
+    return [list(block.parameters()) for block in model_orig.transformer.h]
 
 
-def build_param_to_layer(model_orig):
+def set_layer_requires_grad(layer_params, layer_indices, requires_grad):
+    """Enable or disable gradient computation for the given layer indices."""
+    for i in layer_indices:
+        for p in layer_params[i]:
+            p.requires_grad_(requires_grad)
+
+
+def reset_optimizer_state(optimizer, layer_params, layer_indices):
     """
-    Returns dict mapping param data_ptr -> layer_index (or None for non-block params).
+    Clear Muon momentum buffers for params in the given layers.
+    Called at stage transitions so stale momentum doesn't corrupt new active layers.
     """
-    mapping = {}
-    for i, block in enumerate(model_orig.transformer.h):
-        for p in block.parameters():
-            mapping[p.data_ptr()] = i
-    return mapping
+    target_params = {id(p) for i in layer_indices for p in layer_params[i]}
+    for group in optimizer.param_groups:
+        for p in group['params']:
+            if id(p) in target_params and p in optimizer.state:
+                optimizer.state[p].clear()
 
 
 # ---------------------------------------------------------------------------
@@ -600,13 +603,16 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-# Build staged schedule before compiling (needs original model)
+# Build staged schedule before compiling (needs original model param references)
 stage_schedule = build_stage_schedule(config.n_layer)
-param_to_layer = build_param_to_layer(model)  # data_ptr -> layer idx
+layer_params = build_layer_params(model)  # layer_params[i] = list of params in block i
 
 print(f"Staged training: {len(stage_schedule)} stages")
 for i, s in enumerate(stage_schedule):
     print(f"  Stage {i}: full_lr={s['full_lr']} reduced_lr={s['reduced_lr']} frozen={s['frozen']} budget={s['time_budget']:.0f}s")
+
+# Apply initial requires_grad=False for frozen layers (stage 0)
+set_layer_requires_grad(layer_params, stage_schedule[0]["frozen"], requires_grad=False)
 
 model = torch.compile(model, dynamic=False)
 
@@ -686,18 +692,10 @@ while True:
         loss.backward()
         x, y, epoch = next(train_loader)
 
-    # Zero gradients for frozen layers, scale down gradients for boundary layers
-    # Must access original (uncompiled) model params via param_to_layer
-    for group in optimizer.param_groups:
-        for p in group['params']:
-            if p.grad is None:
-                continue
-            layer_idx = param_to_layer.get(p.data_ptr(), None)
-            if layer_idx is None:
-                continue  # embedding / lm_head / scalars — always train
-            if layer_idx in frozen_set:
-                p.grad = None
-            elif layer_idx in reduced_set:
+    # Scale down gradients for boundary (reduced_lr) layers
+    for i in reduced_set:
+        for p in layer_params[i]:
+            if p.grad is not None:
                 p.grad.mul_(STAGED_BOUNDARY_LR_SCALE)
 
     # Progress within current stage (for LR schedule)
@@ -767,11 +765,22 @@ while True:
     if (step > 10
             and stage_training_time >= stage_info["time_budget"]
             and next_stage < len(stage_schedule)):
-        print(f"\n=== Stage {next_stage}: full_lr={stage_schedule[next_stage]['full_lr']} "
-              f"reduced_lr={stage_schedule[next_stage]['reduced_lr']} "
-              f"frozen={stage_schedule[next_stage]['frozen']} ===")
+        next_info = stage_schedule[next_stage]
+        print(f"\n=== Stage {next_stage}: full_lr={next_info['full_lr']} "
+              f"reduced_lr={next_info['reduced_lr']} "
+              f"frozen={next_info['frozen']} ===")
+
+        # Unfreeze newly active layers
+        set_layer_requires_grad(layer_params, next_info["full_lr"], requires_grad=True)
+        set_layer_requires_grad(layer_params, next_info["reduced_lr"], requires_grad=True)
+        # Freeze newly frozen layers (prev stage's full_lr layers that are now done)
+        set_layer_requires_grad(layer_params, next_info["frozen"], requires_grad=False)
+
+        # Reset optimizer momentum for newly active layers so stale state doesn't harm them
+        reset_optimizer_state(optimizer, layer_params, next_info["full_lr"])
+
         current_stage = next_stage
-        stage_info = stage_schedule[current_stage]
+        stage_info = next_info
         frozen_set  = set(stage_info["frozen"])
         reduced_set = set(stage_info["reduced_lr"])
         stage_training_time = 0   # reset stage clock
