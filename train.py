@@ -11,17 +11,28 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 import gc
 import math
 import time
-from dataclasses import dataclass, asdict
+from datetime import datetime
+from dataclasses import dataclass, asdict, field
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
+# CHANGED: replaced kernels-based flash attention loader with flash_attn package.
+# Original code was:
+#   from kernels import get_kernel
+#   cap = torch.cuda.get_device_capability()
+#   repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
+#   fa3 = get_kernel(repo).flash_attn_interface
+# and the call site was: fa3.flash_attn_func(q, k, v, ...)
+# Reason: kernels-community/flash-attn3 had no compatible build variant for RTX 4090 (sm_89).
+# To revert: uninstall flash-attn, restore the above, and remove the q/k/v cast below.
+from flash_attn import flash_attn_func
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -30,49 +41,58 @@ from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evalua
 # ---------------------------------------------------------------------------
 
 @dataclass
+class BlockConfig:
+    n_head: int = 6
+    n_kv_head: int = 6
+    n_embd: int = 768           # block compute/output width; writes x[:, :, :n_embd]
+    n_in: int | None = None     # attn input width; None = n_embd; can be set wider for full context
+    has_ve: bool = False
+    window_size: tuple = (-1, 0)  # (-1, 0) = full context; (k, 0) = sliding window
+    enabled: bool = True          # if False, this block is skipped (identity pass-through)
+
+
+@dataclass
 class GPTConfig:
     sequence_len: int = 2048
     vocab_size: int = 32768
-    n_layer: int = 12
-    n_head: int = 6
-    n_kv_head: int = 6
-    n_embd: int = 768
-    window_pattern: str = "SSSL"
+    n_model: int = 512          # full residual stream width
+    blocks: list = field(default_factory=list)  # list[BlockConfig]
+
+    @property
+    def n_layer(self):
+        return len(self.blocks)
 
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
 
-def has_ve(layer_idx, n_layer):
-    """Returns True if layer should have Value Embedding (alternating, last always included)."""
-    return layer_idx % 2 == (n_layer - 1) % 2
-
-
 def apply_rotary_emb(x, cos, sin):
     assert x.ndim == 4
     d = x.shape[3] // 2
     x1, x2 = x[..., :d], x[..., d:]
-    y1 = x1 * cos + x2 * sin
-    y2 = x1 * (-sin) + x2 * cos
+    # Slice cos/sin to match this block's head_dim (cos/sin are precomputed for max head_dim)
+    y1 = x1 * cos[..., :d] + x2 * sin[..., :d]
+    y2 = x1 * (-sin[..., :d]) + x2 * cos[..., :d]
     return torch.cat([y1, y2], 3)
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config):
         super().__init__()
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
+        n_in = config.n_in if config.n_in is not None else config.n_embd
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
-        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_q = nn.Linear(n_in, self.n_head * self.head_dim, bias=False)
+        self.c_k = nn.Linear(n_in, self.n_kv_head * self.head_dim, bias=False)
+        self.c_v = nn.Linear(n_in, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 32
-        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if config.has_ve else None
 
     def forward(self, x, ve, cos_sin, window_size):
         B, T, C = x.size()
@@ -89,8 +109,9 @@ class CausalSelfAttention(nn.Module):
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
+        q, k, v = q.bfloat16(), k.bfloat16(), v.bfloat16()  # CHANGED: cast required; flash_attn only accepts fp16/bf16 (F.rms_norm returns fp32)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        y = flash_attn_func(q, k, v, causal=True, window_size=window_size)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -110,13 +131,15 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config):
         super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
+        self.attn = CausalSelfAttention(config)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
+    def forward(self, x, x_wide, ve, cos_sin, window_size):
+        # x      is [B, T, n_embd] — residual stream for this block
+        # x_wide is [B, T, n_in]   — wider context for attn (equals x when n_in == n_embd)
+        x = x + self.attn(norm(x_wide), ve, cos_sin, window_size)
         x = x + self.mlp(norm(x))
         return x
 
@@ -125,20 +148,24 @@ class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.window_sizes = self._compute_window_sizes(config)
+        self.block_configs = list(config.blocks)
+        self.window_sizes = [bc.window_size for bc in self.block_configs]
+        bc0 = self.block_configs[0]
+        bc_last = self.block_configs[-1]
+        head_dim = max(bc.n_embd // bc.n_head for bc in self.block_configs)
         self.transformer = nn.ModuleDict({
-            "wte": nn.Embedding(config.vocab_size, config.n_embd),
-            "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
+            "wte": nn.Embedding(config.vocab_size, bc0.n_embd),
+            "h": nn.ModuleList([Block(bc) for bc in self.block_configs]),
         })
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        pad_size = config.n_model - bc0.n_embd
+        self.wte_pad = nn.Parameter(torch.zeros(pad_size)) if pad_size > 0 else None
+        self.lm_head = nn.Linear(bc_last.n_embd, config.vocab_size, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
-        # Value embeddings
-        head_dim = config.n_embd // config.n_head
-        kv_dim = config.n_kv_head * head_dim
+        # Value embeddings (kv_dim is per-block)
         self.value_embeds = nn.ModuleDict({
-            str(i): nn.Embedding(config.vocab_size, kv_dim)
-            for i in range(config.n_layer) if has_ve(i, config.n_layer)
+            str(i): nn.Embedding(config.vocab_size, bc.n_kv_head * (bc.n_embd // bc.n_head))
+            for i, bc in enumerate(self.block_configs) if bc.has_ve
         })
         # Rotary embeddings
         self.rotary_seq_len = config.sequence_len * 10
@@ -152,9 +179,8 @@ class GPT(nn.Module):
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
         # Transformer blocks
-        n_embd = self.config.n_embd
-        s = 3**0.5 * n_embd**-0.5
-        for block in self.transformer.h:
+        for block, bc in zip(self.transformer.h, self.block_configs):
+            s = 3**0.5 * bc.n_embd**-0.5
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
@@ -172,7 +198,7 @@ class GPT(nn.Module):
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
         # Rotary embeddings
-        head_dim = self.config.n_embd // self.config.n_head
+        head_dim = max(bc.n_embd // bc.n_head for bc in self.block_configs)
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
         # Cast embeddings to bf16
@@ -192,30 +218,18 @@ class GPT(nn.Module):
         cos, sin = cos[None, :, None, :], sin[None, :, None, :]
         return cos, sin
 
-    def _compute_window_sizes(self, config):
-        pattern = config.window_pattern.upper()
-        assert all(c in "SL" for c in pattern)
-        long_window = config.sequence_len
-        short_window = long_window // 2
-        char_to_window = {"L": (long_window, 0), "S": (short_window, 0)}
-        window_sizes = []
-        for layer_idx in range(config.n_layer):
-            char = pattern[layer_idx % len(pattern)]
-            window_sizes.append(char_to_window[char])
-        window_sizes[-1] = (long_window, 0)
-        return window_sizes
-
     def estimate_flops(self):
         """Estimated FLOPs per token (forward + backward)."""
         nparams = sum(p.numel() for p in self.parameters())
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
+        wte_pad_numel = self.wte_pad.numel() if self.wte_pad is not None else 0
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
-                          self.resid_lambdas.numel() + self.x0_lambdas.numel())
-        h = self.config.n_head
-        q = self.config.n_embd // self.config.n_head
+                          wte_pad_numel + self.resid_lambdas.numel() + self.x0_lambdas.numel())
         t = self.config.sequence_len
         attn_flops = 0
-        for window_size in self.window_sizes:
+        for bc, window_size in zip(self.block_configs, self.window_sizes):
+            h = bc.n_head
+            q = bc.n_embd // bc.n_head
             window = window_size[0]
             effective_seq = t if window < 0 else min(window, t)
             attn_flops += 12 * h * q * effective_seq
@@ -235,15 +249,17 @@ class GPT(nn.Module):
 
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
                         weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
-        model_dim = self.config.n_embd
+        model_dim = self.block_configs[0].n_embd
         matrix_params = list(self.transformer.h.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
+        wte_pad_params = [self.wte_pad] if self.wte_pad is not None else []
         assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
-            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
+            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) +
+            len(wte_pad_params))
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
@@ -251,6 +267,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=wte_pad_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
@@ -270,17 +287,29 @@ class GPT(nn.Module):
         assert T <= self.cos.size(1)
         cos_sin = self.cos[:, :T], self.sin[:, :T]
 
-        x = self.transformer.wte(idx)
+        x = self.transformer.wte(idx)          # [B, T, bc0.n_embd]
+        if self.wte_pad is not None:
+            pad = self.wte_pad.expand(B, T, -1)
+            x = torch.cat([x, pad], dim=-1)    # [B, T, n_model]
         x = norm(x)
         x0 = x
         for i, block in enumerate(self.transformer.h):
+            bc = self.block_configs[i]
+            if not bc.enabled:
+                continue
+            n_embd = bc.n_embd
+            n_in = bc.n_in if bc.n_in is not None else n_embd
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i])
+            x_narrow = x[:, :, :n_embd]
+            x_wide = x[:, :, :n_in]
+            out = block(x_narrow, x_wide, ve, cos_sin, self.window_sizes[i])  # [B,T,n_embd]
+            x = torch.cat([out, x[:, :, n_embd:]], dim=-1)
         x = norm(x)
 
         softcap = 15
-        logits = self.lm_head(x)
+        n_embd_last = self.block_configs[-1].n_embd
+        logits = self.lm_head(x[:, :, :n_embd_last])
         logits = logits.float()
         logits = softcap * torch.tanh(logits / softcap)
 
@@ -429,11 +458,6 @@ class MuonAdamW(torch.optim.Optimizer):
 # Hyperparameters (edit these directly, no CLI flags needed)
 # ---------------------------------------------------------------------------
 
-# Model architecture
-ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
-HEAD_DIM = 128          # target head dimension for attention
-WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
-
 # Optimization
 TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
 EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
@@ -446,8 +470,6 @@ WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
-# Model size
-DEPTH = 8               # number of transformer layers
 DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
 # ---------------------------------------------------------------------------
@@ -466,17 +488,16 @@ tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
 print(f"Vocab size: {vocab_size:,}")
 
-def build_model_config(depth):
-    base_dim = depth * ASPECT_RATIO
-    model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
-    num_heads = model_dim // HEAD_DIM
-    return GPTConfig(
-        sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-        window_pattern=WINDOW_PATTERN,
-    )
+S   = BlockConfig(n_head=4, n_kv_head=4, n_embd=512, has_ve=False, window_size=(1024, 0))
+SVE = BlockConfig(n_head=4, n_kv_head=4, n_embd=512, has_ve=True,  window_size=(1024, 0))
+LVE = BlockConfig(n_head=4, n_kv_head=4, n_embd=512, has_ve=True,  window_size=(2048, 0))
 
-config = build_model_config(DEPTH)
+config = GPTConfig(
+    sequence_len=MAX_SEQ_LEN,
+    vocab_size=vocab_size,
+    n_model=512,
+    blocks=[S, SVE, S, LVE, S, SVE, S, LVE],
+)
 print(f"Model config: {asdict(config)}")
 
 with torch.device("meta"):
@@ -512,6 +533,31 @@ x, y, epoch = next(train_loader)  # prefetch first batch
 
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
+
+if wandb is not None:
+    try:
+        wandb.init(
+            project=os.environ.get("WANDB_PROJECT", "autoresearch"),
+            config={
+                **asdict(config),
+                "total_batch_size": TOTAL_BATCH_SIZE,
+                "device_batch_size": DEVICE_BATCH_SIZE,
+                "embedding_lr": EMBEDDING_LR,
+                "unembedding_lr": UNEMBEDDING_LR,
+                "matrix_lr": MATRIX_LR,
+                "scalar_lr": SCALAR_LR,
+                "weight_decay": WEIGHT_DECAY,
+                "adam_betas": ADAM_BETAS,
+                "warmup_ratio": WARMUP_RATIO,
+                "warmdown_ratio": WARMDOWN_RATIO,
+                "final_lr_frac": FINAL_LR_FRAC,
+                "num_params_M": num_params / 1e6,
+                "grad_accum_steps": grad_accum_steps,
+            },
+        )
+    except Exception as e:
+        print(f"wandb init failed (continuing without): {e}")
+        wandb = None
 
 # Schedules (all based on progress = training_time / TIME_BUDGET)
 
@@ -589,6 +635,15 @@ while True:
 
     print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
 
+    if wandb is not None and step > 10:
+        wandb.log({
+            "train/loss": debiased_smooth_loss,
+            "train/lr_multiplier": lrm,
+            "train/mfu_percent": mfu,
+            "train/tok_per_sec": tok_per_sec,
+            "train/progress_pct": pct_done,
+        }, step=step)
+
     # GC management (Python's GC causes ~500ms stalls)
     if step == 0:
         gc.collect()
@@ -627,4 +682,28 @@ print(f"mfu_percent:      {steady_state_mfu:.2f}")
 print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
-print(f"depth:            {DEPTH}")
+print(f"depth:            {config.n_layer}")
+
+if wandb is not None:
+    wandb.log({
+        "eval/val_bpb": val_bpb,
+        "eval/peak_vram_mb": peak_vram_mb,
+        "eval/mfu_percent": steady_state_mfu,
+        "eval/total_tokens_M": total_tokens / 1e6,
+        "eval/num_steps": step,
+        "eval/training_seconds": total_training_time,
+    })
+    wandb.finish()
+
+# Save final checkpoint
+ckpt_dir = "/data/checkpoints"
+os.makedirs(ckpt_dir, exist_ok=True)
+ckpt_path = os.path.join(ckpt_dir, f"checkpoint_{datetime.now().strftime('%Y%m%d_%H%M%S')}_step{step:05d}.pt")
+torch.save({
+    "model": model._orig_mod.state_dict(),
+    "config": asdict(config),
+    "step": step,
+    "val_bpb": val_bpb,
+    "total_tokens": total_tokens,
+}, ckpt_path)
+print(f"checkpoint:       {ckpt_path}")
