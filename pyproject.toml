@@ -13,6 +13,7 @@ dependencies = [
     "rustbpe",
     "tiktoken",
     "PyYAML",
+    "wandb",
 ]
 
 [tool.setuptools]
