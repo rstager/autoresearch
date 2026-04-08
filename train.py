@@ -669,7 +669,7 @@ train_loader, DEVICE_BATCH_SIZE, grad_accum_steps = activate_stage(
     0, stacked_schedule, model, optimizer, tokenizer)
 
 # Compile once with stage 0 layers already enabled
-model = torch.compile(model, dynamic=False)
+model = torch.compile(model, dynamic=True)
 
 x, y, epoch = next(train_loader)  # prefetch first batch
 
