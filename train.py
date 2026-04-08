@@ -219,28 +219,46 @@ class GPT(nn.Module):
         return cos, sin
 
     def estimate_flops(self):
-        """Estimated FLOPs per token (forward + backward)."""
-        nparams = sum(p.numel() for p in self.parameters())
-        value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
-        wte_pad_numel = self.wte_pad.numel() if self.wte_pad is not None else 0
-        nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
-                          wte_pad_numel + self.resid_lambdas.numel() + self.x0_lambdas.numel())
+        """Estimated FLOPs per token (forward + backward), counting only enabled layers."""
+        enabled_block_params = sum(
+            p.numel()
+            for i, block in enumerate(self.transformer.h)
+            if self.block_configs[i].enabled
+            for p in block.parameters()
+        )
+        lm_head_params = sum(p.numel() for p in self.lm_head.parameters())
         t = self.config.sequence_len
         attn_flops = 0
         for bc, window_size in zip(self.block_configs, self.window_sizes):
+            if not bc.enabled:
+                continue
             h = bc.n_head
             q = bc.n_embd // bc.n_head
             window = window_size[0]
             effective_seq = t if window < 0 else min(window, t)
             attn_flops += 12 * h * q * effective_seq
-        return 6 * (nparams - nparams_exclude) + attn_flops
+        return 6 * (lm_head_params + enabled_block_params) + attn_flops
 
-    def num_scaling_params(self):
+    def num_scaling_params(self, active_only=False):
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
-        value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
-        transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
+        if active_only:
+            transformer_matrices = sum(
+                p.numel()
+                for i, block in enumerate(self.transformer.h)
+                if self.block_configs[i].enabled
+                for p in block.parameters()
+            )
+            value_embeds = sum(
+                p.numel()
+                for k, ve in self.value_embeds.items()
+                if self.block_configs[int(k)].enabled
+                for p in ve.parameters()
+            )
+        else:
+            transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
+            value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
         return {
             'wte': wte, 'value_embeds': value_embeds, 'lm_head': lm_head,
@@ -250,16 +268,12 @@ class GPT(nn.Module):
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
                         weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.block_configs[0].n_embd
-        matrix_params = list(self.transformer.h.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         wte_pad_params = [self.wte_pad] if self.wte_pad is not None else []
-        assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
-            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) +
-            len(wte_pad_params))
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
@@ -271,12 +285,22 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
-            param_groups.append(dict(
-                kind='muon', params=group_params, lr=matrix_lr,
-                momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
-            ))
+        # Per-layer Muon groups: one group per (layer_idx, param_shape).
+        # The 'active' flag mirrors bc.enabled and is toggled at stage transitions.
+        all_layer_muon_params = []
+        for layer_idx, (block, bc) in enumerate(zip(self.transformer.h, self.block_configs)):
+            layer_params = list(block.parameters())
+            all_layer_muon_params.extend(layer_params)
+            for shape in sorted({p.shape for p in layer_params}):
+                shape_params = [p for p in layer_params if p.shape == shape]
+                param_groups.append(dict(
+                    kind='muon', params=shape_params,
+                    layer_idx=layer_idx, active=bc.enabled,
+                    lr=matrix_lr, momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
+                ))
+        non_muon_params = (lm_head_params + embedding_params + value_embeds_params +
+                           wte_pad_params + resid_params + x0_params)
+        assert len(list(self.parameters())) == len(non_muon_params) + len(all_layer_muon_params)
         optimizer = MuonAdamW(param_groups)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
@@ -452,7 +476,108 @@ class MuonAdamW(torch.optim.Optimizer):
             if group['kind'] == 'adamw':
                 self._step_adamw(group)
             elif group['kind'] == 'muon':
+                if not group.get('active', True):
+                    continue
                 self._step_muon(group)
+
+# ---------------------------------------------------------------------------
+# Stacked layer training
+# ---------------------------------------------------------------------------
+
+def build_stacked_schedule(n_layer, total_matrix_params,
+                            total_batch_size=2**19, max_seq_len=2048,
+                            initial_device_batch=128):
+    """
+    Build the outside-in stage schedule for stacked layer training.
+
+    Layers are enabled in pairs from the outside in: [0,N-1], [1,N-2], ...
+    Token budget = equal split of 20 * total_matrix_params across all stages.
+    Batch size scales down proportionally as more layers are active, keeping
+    TOTAL_BATCH_SIZE constant via increased grad_accum_steps.
+
+    Returns list of dicts:
+      {new_layers, active_layers, token_budget, device_batch_size, grad_accum_steps}
+    """
+    # Outside-in pairing
+    stages_new = []
+    lo, hi = 0, n_layer - 1
+    while lo <= hi:
+        stages_new.append([lo] if lo == hi else [lo, hi])
+        lo += 1
+        hi -= 1
+    n_stages = len(stages_new)
+
+    # Valid device batch sizes: divisors of total_batch_size // max_seq_len
+    max_divisor = total_batch_size // max_seq_len
+    valid_batches = sorted([b for b in range(1, max_divisor + 1) if max_divisor % b == 0],
+                           reverse=True)
+
+    token_budget_per_stage = (20 * total_matrix_params // n_stages // total_batch_size) * total_batch_size
+    token_budget_per_stage = max(total_batch_size, token_budget_per_stage)
+
+    # Valid device batch sizes: multiples of 16 that divide total_batch_size / max_seq_len
+    valid_batches = sorted(
+        [b for b in valid_batches if b % 16 == 0 or b <= 16],
+        reverse=True
+    )
+    if not valid_batches:
+        valid_batches = [max(b for b in range(1, max_divisor + 1) if max_divisor % b == 0)]
+
+    initial_n_active = len(stages_new[0])
+    schedule = []
+    active = []
+    for stage_idx, new_layers in enumerate(stages_new):
+        active = active + new_layers
+        n_active = len(active)
+
+        # Batch size scales with activation memory: proportional to 1/n_active.
+        # We only step down when n_active doubles (i.e. use floor-to-power-of-2 logic),
+        # and always keep multiples of 16 for GPU efficiency.
+        if stage_idx == 0:
+            device_batch = initial_device_batch
+        else:
+            # Scale proportionally but floor to nearest multiple of 16
+            target = initial_device_batch * initial_n_active / n_active
+            # Find the largest valid batch size <= target that is a multiple of 16
+            candidates = [b for b in valid_batches if b <= target]
+            device_batch = candidates[0] if candidates else valid_batches[-1]
+
+        grad_accum = total_batch_size // (device_batch * max_seq_len)
+        schedule.append({
+            'new_layers':        list(new_layers),
+            'active_layers':     list(active),
+            'token_budget':      token_budget_per_stage,
+            'device_batch_size': device_batch,
+            'grad_accum_steps':  grad_accum,
+        })
+    return schedule
+
+
+def activate_stage(stage_idx, schedule, raw_model, optimizer, tokenizer):
+    """
+    Enable new layers for this stage, mark their Muon groups active, and
+    return a fresh dataloader with the updated batch size.
+
+    Muon momentum state is NOT reset — it carries forward across stages.
+    """
+    s = schedule[stage_idx]
+    new_layer_set = set(s['new_layers'])
+
+    # Enable new layers in BlockConfig
+    for layer_idx in s['new_layers']:
+        raw_model.block_configs[layer_idx].enabled = True
+
+    # Mark Muon groups for new layers as active
+    for group in optimizer.param_groups:
+        if group.get('kind') == 'muon' and group.get('layer_idx') in new_layer_set:
+            group['active'] = True
+
+    train_loader = make_dataloader(tokenizer, s['device_batch_size'], MAX_SEQ_LEN, "train")
+    print(f"\n[Stage {stage_idx}] Enabled layers {s['new_layers']}, "
+          f"active={s['active_layers']}, "
+          f"batch={s['device_batch_size']}, grad_accum={s['grad_accum_steps']}")
+    return train_loader, s['device_batch_size'], s['grad_accum_steps']
+
 
 # ---------------------------------------------------------------------------
 # Hyperparameters (edit these directly, no CLI flags needed)
@@ -505,17 +630,16 @@ with torch.device("meta"):
 model.to_empty(device=device)
 model.init_weights()
 
+# Disable all layers initially — activate_stage will enable them in order
+for bc in config.blocks:
+    bc.enabled = False
+
 param_counts = model.num_scaling_params()
-print("Parameter counts:")
+print("Parameter counts (all layers):")
 for key, value in param_counts.items():
     print(f"  {key:24s}: {value:,}")
 num_params = param_counts['total']
-num_flops_per_token = model.estimate_flops()
-print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
-
-tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
-assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
-grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
+total_matrix_params = param_counts['transformer_matrices']
 
 optimizer = model.setup_optimizer(
     unembedding_lr=UNEMBEDDING_LR,
@@ -526,11 +650,31 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
+# Build stacked schedule and activate stage 0 (enables outer layers, creates loader)
+stacked_schedule = build_stacked_schedule(
+    n_layer=config.n_layer,
+    total_matrix_params=total_matrix_params,
+    total_batch_size=TOTAL_BATCH_SIZE,
+    max_seq_len=MAX_SEQ_LEN,
+    initial_device_batch=DEVICE_BATCH_SIZE,
+)
+print(f"Stacked training: {len(stacked_schedule)} stages, "
+      f"token budget per stage: {stacked_schedule[0]['token_budget']/1e6:.0f}M")
+for i, s in enumerate(stacked_schedule):
+    print(f"  Stage {i}: new={s['new_layers']} active={s['active_layers']} "
+          f"batch={s['device_batch_size']} grad_accum={s['grad_accum_steps']}")
+
+current_stage = 0
+train_loader, DEVICE_BATCH_SIZE, grad_accum_steps = activate_stage(
+    0, stacked_schedule, model, optimizer, tokenizer)
+
+# Compile once with stage 0 layers already enabled
 model = torch.compile(model, dynamic=False)
 
-train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
 
+num_flops_per_token = model._orig_mod.estimate_flops()
+print(f"Estimated FLOPs per token (stage 0): {num_flops_per_token:e}")
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
 
@@ -584,6 +728,8 @@ def get_weight_decay(progress):
 t_start_training = time.time()
 smooth_train_loss = 0
 total_training_time = 0
+total_tokens_trained = 0  # tokens seen (excludes warmup steps)
+tokens_in_stage = 0       # tokens in current stage (excludes warmup steps)
 step = 0
 
 while True:
@@ -597,8 +743,8 @@ while True:
         loss.backward()
         x, y, epoch = next(train_loader)
 
-    # Progress and schedules
-    progress = min(total_training_time / TIME_BUDGET, 1.0)
+    # Progress and schedules (token-based)
+    progress = min(total_tokens_trained / (20 * total_matrix_params), 1.0)
     lrm = get_lr_multiplier(progress)
     muon_momentum = get_muon_momentum(step)
     muon_weight_decay = get_weight_decay(progress)
@@ -623,17 +769,20 @@ while True:
 
     if step > 10:
         total_training_time += dt
+        total_tokens_trained += TOTAL_BATCH_SIZE
+        tokens_in_stage += TOTAL_BATCH_SIZE
 
     # Logging
     ema_beta = 0.9
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
-    pct_done = 100 * progress
+    global_progress = min(total_tokens_trained / (20 * total_matrix_params), 1.0)
+    pct_done = 100 * global_progress
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
     mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
     remaining = max(0, TIME_BUDGET - total_training_time)
 
-    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+    print(f"\rstep {step:05d} stg{current_stage} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | batch: {DEVICE_BATCH_SIZE} | remaining: {remaining:.0f}s    ", end="", flush=True)
 
     if wandb is not None and step > 10:
         wandb.log({
@@ -642,6 +791,9 @@ while True:
             "train/mfu_percent": mfu,
             "train/tok_per_sec": tok_per_sec,
             "train/progress_pct": pct_done,
+            "train/stage": current_stage,
+            "train/active_layers": len(stacked_schedule[current_stage]['active_layers']),
+            "train/device_batch_size": DEVICE_BATCH_SIZE,
         }, step=step)
 
     # GC management (Python's GC causes ~500ms stalls)
@@ -654,13 +806,24 @@ while True:
 
     step += 1
 
-    # Time's up — but only stop after warmup steps so we don't count compilation
-    if step > 10 and total_training_time >= TIME_BUDGET:
+    # Stage transition: enable next layer pair when this stage's token budget is met
+    if (step > 10
+            and tokens_in_stage >= stacked_schedule[current_stage]['token_budget']
+            and current_stage < len(stacked_schedule) - 1):
+        tokens_in_stage = 0
+        current_stage += 1
+        train_loader, DEVICE_BATCH_SIZE, grad_accum_steps = activate_stage(
+            current_stage, stacked_schedule, model._orig_mod, optimizer, tokenizer)
+        num_flops_per_token = model._orig_mod.estimate_flops()
+        x, y, epoch = next(train_loader)  # prefetch with new loader
+
+    # Token budget exhausted — only stop after warmup steps
+    if step > 10 and total_tokens_trained >= 20 * total_matrix_params:
         break
 
 print()  # newline after \r training log
 
-total_tokens = step * TOTAL_BATCH_SIZE
+total_tokens = total_tokens_trained
 
 # Final eval
 model.eval()
