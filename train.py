@@ -579,10 +579,14 @@ def calibrate_batch_sizes(schedule, raw_model, autocast_ctx, seq_len, total_batc
     for stage_idx, s in enumerate(schedule):
         print(f"\n  Stage {stage_idx}/{len(schedule)-1}: layers={s['active_layers']} "
               f"({len(s['active_layers'])} active)")
-        for bc in raw_model.block_configs:
-            bc.enabled = False
+        # Move all layers to CPU, then bring only active ones to GPU
+        for layer_idx in range(len(raw_model.block_configs)):
+            raw_model.block_configs[layer_idx].enabled = False
+            _move_layer_to(raw_model, optimizer, layer_idx, torch.device("cpu"))
         for layer_idx in s['active_layers']:
             raw_model.block_configs[layer_idx].enabled = True
+            _move_layer_to(raw_model, optimizer, layer_idx, device)
+        torch.cuda.empty_cache()
 
         found_batch = None
         for batch_size in valid_batches:
@@ -637,11 +641,42 @@ def calibrate_batch_sizes(schedule, raw_model, autocast_ctx, seq_len, total_batc
               f"tok/sec={tok_per_sec:,.0f} MFU≈{mfu:.1f}% dt={avg_dt*1000:.0f}ms")
         calibrated.append(found_batch)
 
-    # Restore all-disabled state for normal training startup
-    for bc in raw_model.block_configs:
-        bc.enabled = False
+    # Restore all-disabled, all-offloaded state for normal training startup
+    for layer_idx in range(len(raw_model.block_configs)):
+        raw_model.block_configs[layer_idx].enabled = False
+        _move_layer_to(raw_model, optimizer, layer_idx, torch.device("cpu"))
+    torch.cuda.empty_cache()
 
     return calibrated
+
+
+def _move_layer_to(raw_model, optimizer, layer_idx, target_device):
+    """Move a transformer layer, its value embeddings, and optimizer state to target_device."""
+    block = raw_model.transformer.h[layer_idx]
+    block.to(target_device)
+    ve_key = str(layer_idx)
+    if ve_key in raw_model.value_embeds:
+        raw_model.value_embeds[ve_key].to(target_device)
+    # Move optimizer state for this layer's param groups
+    for group in optimizer.param_groups:
+        if group.get('layer_idx') != layer_idx:
+            continue
+        for p in group['params']:
+            if p not in optimizer.state:
+                continue
+            for k, v in optimizer.state[p].items():
+                if isinstance(v, torch.Tensor):
+                    optimizer.state[p][k] = v.to(target_device)
+
+
+def _offload_inactive_layers(raw_model, optimizer):
+    """Move all inactive layers to CPU. Call after model init but before training."""
+    for layer_idx, bc in enumerate(raw_model.block_configs):
+        if not bc.enabled:
+            _move_layer_to(raw_model, optimizer, layer_idx, torch.device("cpu"))
+    torch.cuda.empty_cache()
+    vram_used = torch.cuda.memory_allocated() / 1e9
+    print(f"Offloaded inactive layers to CPU. GPU memory: {vram_used:.1f} GB")
 
 
 def activate_stage(stage_idx, schedule, raw_model, optimizer, tokenizer):
@@ -649,24 +684,29 @@ def activate_stage(stage_idx, schedule, raw_model, optimizer, tokenizer):
     Enable new layers for this stage, mark their Muon groups active, and
     return a fresh dataloader with the updated batch size.
 
+    Moves newly active layers (and their optimizer state) from CPU to GPU.
     Muon momentum state is NOT reset — it carries forward across stages.
     """
     s = schedule[stage_idx]
     new_layer_set = set(s['new_layers'])
+    device = next(p for p in raw_model.lm_head.parameters()).device
 
-    # Enable new layers in BlockConfig
+    # Move new layers to GPU, enable them, and mark optimizer groups active
     for layer_idx in s['new_layers']:
+        _move_layer_to(raw_model, optimizer, layer_idx, device)
         raw_model.block_configs[layer_idx].enabled = True
 
-    # Mark Muon groups for new layers as active
     for group in optimizer.param_groups:
         if group.get('kind') == 'muon' and group.get('layer_idx') in new_layer_set:
             group['active'] = True
 
+    torch.cuda.empty_cache()
+    vram_used = torch.cuda.memory_allocated() / 1e9
     train_loader = make_dataloader(tokenizer, s['device_batch_size'], MAX_SEQ_LEN, "train")
     print(f"\n[Stage {stage_idx}] Enabled layers {s['new_layers']}, "
           f"active={s['active_layers']}, "
-          f"batch={s['device_batch_size']}, grad_accum={s['grad_accum_steps']}")
+          f"batch={s['device_batch_size']}, grad_accum={s['grad_accum_steps']}, "
+          f"GPU mem={vram_used:.1f} GB")
     return train_loader, s['device_batch_size'], s['grad_accum_steps']
 
 
@@ -762,6 +802,11 @@ optimizer = model.setup_optimizer(
     matrix_lr=MATRIX_LR,
     weight_decay=WEIGHT_DECAY,
 )
+
+# Start with all layers disabled and offloaded to CPU — activate_stage will move them to GPU
+for bc in model.block_configs:
+    bc.enabled = False
+_offload_inactive_layers(model, optimizer)
 
 # Build stacked schedule; batch sizes come from STAGE_BATCH_SIZES if calibrated, else heuristic
 stacked_schedule = build_stacked_schedule(
