@@ -587,6 +587,11 @@ def calibrate_batch_sizes(schedule, raw_model, optimizer, autocast_ctx, seq_len,
             raw_model.block_configs[layer_idx].enabled = True
             _move_layer_to(raw_model, optimizer, layer_idx, device)
         torch.cuda.empty_cache()
+        # Debug: verify device placement
+        for i, bc in enumerate(raw_model.block_configs):
+            dev = next(raw_model.transformer.h[i].parameters()).device
+            if bc.enabled and str(dev) != "cuda:0":
+                print(f"    WARNING: layer {i} enabled but on {dev}")
 
         found_batch = None
         for batch_size in valid_batches:
