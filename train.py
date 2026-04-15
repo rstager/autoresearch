@@ -571,9 +571,14 @@ def calibrate_batch_sizes(schedule, raw_model, autocast_ctx, seq_len, total_batc
         valid_batches = [max(b for b in range(1, max_divisor + 1) if max_divisor % b == 0)]
 
     device = next(raw_model.parameters()).device
+    total_vram = torch.cuda.get_device_properties(device).total_mem / 1e9
+    print(f"  GPU VRAM: {total_vram:.1f} GB")
+    print(f"  Candidate batch sizes: {valid_batches}")
     calibrated = []
 
     for stage_idx, s in enumerate(schedule):
+        print(f"\n  Stage {stage_idx}/{len(schedule)-1}: layers={s['active_layers']} "
+              f"({len(s['active_layers'])} active)")
         for bc in raw_model.block_configs:
             bc.enabled = False
         for layer_idx in s['active_layers']:
@@ -592,8 +597,11 @@ def calibrate_batch_sizes(schedule, raw_model, autocast_ctx, seq_len, total_batc
                 loss.backward()
                 raw_model.zero_grad(set_to_none=True)
                 found_batch = batch_size
+                vram_used = torch.cuda.max_memory_allocated(device) / 1e9
+                torch.cuda.reset_peak_memory_stats(device)
+                print(f"    batch={batch_size}: OK (peak {vram_used:.1f}/{total_vram:.1f} GB)")
             except torch.cuda.OutOfMemoryError:
-                pass
+                print(f"    batch={batch_size}: OOM")
             finally:
                 del x, y, loss
                 torch.cuda.empty_cache()
@@ -604,7 +612,7 @@ def calibrate_batch_sizes(schedule, raw_model, autocast_ctx, seq_len, total_batc
         if found_batch is None:
             raise RuntimeError(f"Stage {stage_idx}: OOM at all batch sizes {valid_batches}")
 
-        # Measure MFU at found_batch (uncompiled; approximate but consistent)
+        # Measure throughput at found_batch (uncompiled; approximate but consistent)
         num_flops = raw_model.estimate_flops()
         t_times = []
         for _ in range(n_probe_steps + 2):
@@ -624,8 +632,8 @@ def calibrate_batch_sizes(schedule, raw_model, autocast_ctx, seq_len, total_batc
         tok_per_sec = found_batch * seq_len / avg_dt
         mfu = 100 * num_flops * tok_per_sec / GPU_BF16_PEAK_FLOPS
         grad_accum = total_batch_size // (found_batch * seq_len)
-        print(f"  Stage {stage_idx}: active={s['active_layers']} "
-              f"batch={found_batch} grad_accum={grad_accum} MFU≈{mfu:.1f}%")
+        print(f"    → batch={found_batch} grad_accum={grad_accum} "
+              f"tok/sec={tok_per_sec:,.0f} MFU≈{mfu:.1f}% dt={avg_dt*1000:.0f}ms")
         calibrated.append(found_batch)
 
     # Restore all-disabled state for normal training startup
@@ -679,7 +687,12 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM); used as initial heuristic
 N_TOP_LAYERS = 2         # top N layers always live; bottom layers added one per stage
-STAGE_BATCH_SIZES: list[int] = []  # calibrated per-stage batch sizes; empty = run calibration
+STAGE_BATCH_SIZES: list[int] = []  # calibrated per-stage batch sizes; empty = try import, then calibrate
+if not STAGE_BATCH_SIZES:
+    try:
+        from stage_batch_sizes import STAGE_BATCH_SIZES
+    except ImportError:
+        pass
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -768,13 +781,11 @@ if not STAGE_BATCH_SIZES:
     for s, bs in zip(stacked_schedule, calibrated):
         s['device_batch_size'] = bs
         s['grad_accum_steps'] = TOTAL_BATCH_SIZE // (bs * MAX_SEQ_LEN)
-    # Persist to source file so future runs skip calibration
-    import re as _re
-    _src = open(__file__).read()
-    _src = _re.sub(r'STAGE_BATCH_SIZES\s*:\s*list\[int\]\s*=\s*\[\]',
-                   f'STAGE_BATCH_SIZES: list[int] = {calibrated}', _src)
-    open(__file__, 'w').write(_src)
-    print(f"Saved STAGE_BATCH_SIZES = {calibrated} to {__file__}")
+    # Persist to stage_batch_sizes.py so future runs skip calibration
+    _path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stage_batch_sizes.py")
+    with open(_path, 'w') as _f:
+        _f.write(f"STAGE_BATCH_SIZES: list[int] = {calibrated}\n")
+    print(f"Saved STAGE_BATCH_SIZES = {calibrated} to {_path}")
 
 print(f"Stacked training: {len(stacked_schedule)} stages, "
       f"token budget per stage: {stacked_schedule[0]['token_budget']/1e6:.0f}M")
