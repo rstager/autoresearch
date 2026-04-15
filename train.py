@@ -570,7 +570,7 @@ def calibrate_batch_sizes(schedule, raw_model, optimizer, autocast_ctx, seq_len,
     if not valid_batches:
         valid_batches = [max_batch] if max_batch > 0 else [1]
 
-    device = next(raw_model.parameters()).device
+    device = torch.device("cuda")
     total_vram = torch.cuda.get_device_properties(device).total_memory / 1e9
     print(f"  GPU VRAM: {total_vram:.1f} GB")
     print(f"  Candidate batch sizes: {valid_batches}")
