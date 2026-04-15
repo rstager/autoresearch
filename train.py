@@ -583,15 +583,16 @@ def calibrate_batch_sizes(schedule, raw_model, optimizer, autocast_ctx, seq_len,
         for layer_idx in range(len(raw_model.block_configs)):
             raw_model.block_configs[layer_idx].enabled = False
             _move_layer_to(raw_model, optimizer, layer_idx, torch.device("cpu"))
+        enabled_after_disable = [bc.enabled for bc in raw_model.block_configs]
+        print(f"    after disable all: {enabled_after_disable}")
         for layer_idx in s['active_layers']:
             raw_model.block_configs[layer_idx].enabled = True
             _move_layer_to(raw_model, optimizer, layer_idx, device)
+        enabled_after_enable = [bc.enabled for bc in raw_model.block_configs]
+        print(f"    after enable active: {enabled_after_enable}")
+        print(f"    block_configs id: {id(raw_model.block_configs)}")
+        print(f"    block_configs[2] id: {id(raw_model.block_configs[2])}, enabled: {raw_model.block_configs[2].enabled}")
         torch.cuda.empty_cache()
-        # Debug: verify device placement
-        for i, bc in enumerate(raw_model.block_configs):
-            dev = next(raw_model.transformer.h[i].parameters()).device
-            if bc.enabled and str(dev) != "cuda:0":
-                print(f"    WARNING: layer {i} enabled but on {dev}")
 
         found_batch = None
         for batch_size in valid_batches:
