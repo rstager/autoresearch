@@ -554,7 +554,7 @@ def build_stacked_schedule(n_layer, total_matrix_params,
     return schedule
 
 
-def calibrate_batch_sizes(schedule, raw_model, autocast_ctx, seq_len, total_batch_size,
+def calibrate_batch_sizes(schedule, raw_model, optimizer, autocast_ctx, seq_len, total_batch_size,
                            n_probe_steps=5):
     """
     For each stage, find the largest device batch size that doesn't OOM and measure MFU.
@@ -822,7 +822,7 @@ stacked_schedule = build_stacked_schedule(
 if not STAGE_BATCH_SIZES:
     print("STAGE_BATCH_SIZES not set — calibrating per-stage batch sizes...")
     calibrated = calibrate_batch_sizes(
-        stacked_schedule, model, autocast_ctx, MAX_SEQ_LEN, TOTAL_BATCH_SIZE)
+        stacked_schedule, model, optimizer, autocast_ctx, MAX_SEQ_LEN, TOTAL_BATCH_SIZE)
     # Update schedule in-place with calibrated sizes
     for s, bs in zip(stacked_schedule, calibrated):
         s['device_batch_size'] = bs
