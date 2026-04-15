@@ -622,7 +622,7 @@ def calibrate_batch_sizes(schedule, raw_model, autocast_ctx, seq_len, total_batc
 
         avg_dt = sum(t_times[2:]) / len(t_times[2:])
         tok_per_sec = found_batch * seq_len / avg_dt
-        mfu = 100 * num_flops * tok_per_sec / H100_BF16_PEAK_FLOPS
+        mfu = 100 * num_flops * tok_per_sec / GPU_BF16_PEAK_FLOPS
         grad_accum = total_batch_size // (found_batch * seq_len)
         print(f"  Stage {stage_idx}: active={s['active_layers']} "
               f"batch={found_batch} grad_accum={grad_accum} MFU≈{mfu:.1f}%")
@@ -691,7 +691,22 @@ torch.cuda.manual_seed(42)
 torch.set_float32_matmul_precision("high")
 device = torch.device("cuda")
 autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-H100_BF16_PEAK_FLOPS = 989.5e12
+
+# BF16 peak FLOPS by GPU — used only for MFU reporting, not training logic
+_GPU_BF16_PEAK_FLOPS = {
+    "H100":  989.5e12,
+    "H200":  989.5e12,
+    "A100":  312e12,
+    "A10G":  70.0e12,
+    "L4":    121e12,
+    "RTX 4090": 330e12,
+    "RTX 4080": 205e12,
+    "RTX 3090": 142e12,
+    "RTX A6000": 155e12,
+}
+_gpu_name = torch.cuda.get_device_name(0)
+GPU_BF16_PEAK_FLOPS = next((v for k, v in _GPU_BF16_PEAK_FLOPS.items() if k in _gpu_name), 989.5e12)
+print(f"GPU: {_gpu_name} — BF16 peak: {GPU_BF16_PEAK_FLOPS/1e12:.1f} TFLOPS")
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
@@ -882,7 +897,7 @@ while True:
     global_progress = min(total_tokens_trained / (20 * total_matrix_params), 1.0)
     pct_done = 100 * global_progress
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
+    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / GPU_BF16_PEAK_FLOPS
     remaining = max(0, TIME_BUDGET - total_training_time)
 
     print(f"\rstep {step:05d} stg{current_stage} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | batch: {DEVICE_BATCH_SIZE} | remaining: {remaining:.0f}s    ", end="", flush=True)
@@ -936,7 +951,7 @@ with autocast_ctx:
 # Final summary
 t_end = time.time()
 startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
+steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / GPU_BF16_PEAK_FLOPS if total_training_time > 0 else 0
 peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
 print("---")
