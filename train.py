@@ -486,11 +486,15 @@ class MuonAdamW(torch.optim.Optimizer):
 
 def build_stacked_schedule(n_layer, total_matrix_params,
                             total_batch_size=2**19, max_seq_len=2048,
-                            initial_device_batch=128):
+                            initial_device_batch=128, n_top=2,
+                            stage_batch_sizes=None):
     """
-    Build the outside-in stage schedule for stacked layer training.
+    Build the bottom-up stage schedule for stacked layer training.
 
-    Layers are enabled in pairs from the outside in: [0,N-1], [1,N-2], ...
+    The top n_top layers are always live (providing gradient signal to lm_head).
+    Stage 0 starts with the first n_top bottom layers + all n_top top layers.
+    Each subsequent stage adds one more bottom layer working inward.
+
     Token budget = equal split of 20 * total_matrix_params across all stages.
     Batch size scales down proportionally as more layers are active, keeping
     TOTAL_BATCH_SIZE constant via increased grad_accum_steps.
@@ -498,13 +502,12 @@ def build_stacked_schedule(n_layer, total_matrix_params,
     Returns list of dicts:
       {new_layers, active_layers, token_budget, device_batch_size, grad_accum_steps}
     """
-    # Outside-in pairing
-    stages_new = []
-    lo, hi = 0, n_layer - 1
-    while lo <= hi:
-        stages_new.append([lo] if lo == hi else [lo, hi])
-        lo += 1
-        hi -= 1
+    # Bottom-up: top n_top layers always live; grow from bottom inward
+    top_layers = list(range(n_layer - n_top, n_layer))
+    n_bottom = n_layer - n_top
+    stages_new = [list(range(n_top)) + top_layers]  # stage 0: first n_top bottom + all top
+    for i in range(n_top, n_bottom):
+        stages_new.append([i])
     n_stages = len(stages_new)
 
     # Valid device batch sizes: divisors of total_batch_size // max_seq_len
@@ -530,15 +533,13 @@ def build_stacked_schedule(n_layer, total_matrix_params,
         active = active + new_layers
         n_active = len(active)
 
-        # Batch size scales with activation memory: proportional to 1/n_active.
-        # We only step down when n_active doubles (i.e. use floor-to-power-of-2 logic),
-        # and always keep multiples of 16 for GPU efficiency.
-        if stage_idx == 0:
+        if stage_batch_sizes is not None:
+            device_batch = stage_batch_sizes[stage_idx]
+        elif stage_idx == 0:
             device_batch = initial_device_batch
         else:
-            # Scale proportionally but floor to nearest multiple of 16
+            # Heuristic: scale proportionally to 1/n_active, floor to nearest valid multiple of 16
             target = initial_device_batch * initial_n_active / n_active
-            # Find the largest valid batch size <= target that is a multiple of 16
             candidates = [b for b in valid_batches if b <= target]
             device_batch = candidates[0] if candidates else valid_batches[-1]
 
@@ -551,6 +552,87 @@ def build_stacked_schedule(n_layer, total_matrix_params,
             'grad_accum_steps':  grad_accum,
         })
     return schedule
+
+
+def calibrate_batch_sizes(schedule, raw_model, autocast_ctx, seq_len, total_batch_size,
+                           n_probe_steps=5):
+    """
+    For each stage, find the largest device batch size that doesn't OOM and measure MFU.
+
+    Temporarily enables each stage's active layers on raw_model; restores all-disabled on return.
+    Returns list of int batch sizes, one per stage.
+    """
+    max_divisor = total_batch_size // seq_len
+    valid_batches = sorted(
+        [b for b in range(1, max_divisor + 1) if max_divisor % b == 0 and (b % 16 == 0 or b <= 16)],
+        reverse=True,
+    )
+    if not valid_batches:
+        valid_batches = [max(b for b in range(1, max_divisor + 1) if max_divisor % b == 0)]
+
+    device = next(raw_model.parameters()).device
+    calibrated = []
+
+    for stage_idx, s in enumerate(schedule):
+        for bc in raw_model.block_configs:
+            bc.enabled = False
+        for layer_idx in s['active_layers']:
+            raw_model.block_configs[layer_idx].enabled = True
+
+        found_batch = None
+        for batch_size in valid_batches:
+            torch.cuda.empty_cache()
+            gc.collect()
+            x = y = loss = None
+            try:
+                x = torch.randint(0, raw_model.config.vocab_size, (batch_size, seq_len), device=device)
+                y = torch.randint(0, raw_model.config.vocab_size, (batch_size, seq_len), device=device)
+                with autocast_ctx:
+                    loss = raw_model(x, y)
+                loss.backward()
+                raw_model.zero_grad(set_to_none=True)
+                found_batch = batch_size
+            except torch.cuda.OutOfMemoryError:
+                pass
+            finally:
+                del x, y, loss
+                torch.cuda.empty_cache()
+                gc.collect()
+            if found_batch is not None:
+                break
+
+        if found_batch is None:
+            raise RuntimeError(f"Stage {stage_idx}: OOM at all batch sizes {valid_batches}")
+
+        # Measure MFU at found_batch (uncompiled; approximate but consistent)
+        num_flops = raw_model.estimate_flops()
+        t_times = []
+        for _ in range(n_probe_steps + 2):
+            x = torch.randint(0, raw_model.config.vocab_size, (found_batch, seq_len), device=device)
+            y = torch.randint(0, raw_model.config.vocab_size, (found_batch, seq_len), device=device)
+            torch.cuda.synchronize()
+            t0 = time.time()
+            with autocast_ctx:
+                loss = raw_model(x, y)
+            loss.backward()
+            torch.cuda.synchronize()
+            t_times.append(time.time() - t0)
+            raw_model.zero_grad(set_to_none=True)
+            del x, y, loss
+
+        avg_dt = sum(t_times[2:]) / len(t_times[2:])
+        tok_per_sec = found_batch * seq_len / avg_dt
+        mfu = 100 * num_flops * tok_per_sec / H100_BF16_PEAK_FLOPS
+        grad_accum = total_batch_size // (found_batch * seq_len)
+        print(f"  Stage {stage_idx}: active={s['active_layers']} "
+              f"batch={found_batch} grad_accum={grad_accum} MFU≈{mfu:.1f}%")
+        calibrated.append(found_batch)
+
+    # Restore all-disabled state for normal training startup
+    for bc in raw_model.block_configs:
+        bc.enabled = False
+
+    return calibrated
 
 
 def activate_stage(stage_idx, schedule, raw_model, optimizer, tokenizer):
@@ -595,7 +677,9 @@ WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM); used as initial heuristic
+N_TOP_LAYERS = 2         # top N layers always live; bottom layers added one per stage
+STAGE_BATCH_SIZES: list[int] = []  # calibrated per-stage batch sizes; empty = run calibration
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -650,14 +734,33 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-# Build stacked schedule and activate stage 0 (enables outer layers, creates loader)
+# Build stacked schedule; batch sizes come from STAGE_BATCH_SIZES if calibrated, else heuristic
 stacked_schedule = build_stacked_schedule(
     n_layer=config.n_layer,
     total_matrix_params=total_matrix_params,
     total_batch_size=TOTAL_BATCH_SIZE,
     max_seq_len=MAX_SEQ_LEN,
     initial_device_batch=DEVICE_BATCH_SIZE,
+    n_top=N_TOP_LAYERS,
+    stage_batch_sizes=STAGE_BATCH_SIZES if STAGE_BATCH_SIZES else None,
 )
+
+if not STAGE_BATCH_SIZES:
+    print("STAGE_BATCH_SIZES not set — calibrating per-stage batch sizes...")
+    calibrated = calibrate_batch_sizes(
+        stacked_schedule, model, autocast_ctx, MAX_SEQ_LEN, TOTAL_BATCH_SIZE)
+    # Update schedule in-place with calibrated sizes
+    for s, bs in zip(stacked_schedule, calibrated):
+        s['device_batch_size'] = bs
+        s['grad_accum_steps'] = TOTAL_BATCH_SIZE // (bs * MAX_SEQ_LEN)
+    # Persist to source file so future runs skip calibration
+    import re as _re
+    _src = open(__file__).read()
+    _src = _re.sub(r'STAGE_BATCH_SIZES\s*:\s*list\[int\]\s*=\s*\[\]',
+                   f'STAGE_BATCH_SIZES: list[int] = {calibrated}', _src)
+    open(__file__, 'w').write(_src)
+    print(f"Saved STAGE_BATCH_SIZES = {calibrated} to {__file__}")
+
 print(f"Stacked training: {len(stacked_schedule)} stages, "
       f"token budget per stage: {stacked_schedule[0]['token_budget']/1e6:.0f}M")
 for i, s in enumerate(stacked_schedule):
