@@ -543,7 +543,7 @@ def build_stacked_schedule(n_layer, total_matrix_params,
             candidates = [b for b in valid_batches if b <= target]
             device_batch = candidates[0] if candidates else valid_batches[-1]
 
-        grad_accum = total_batch_size // (device_batch * max_seq_len)
+        grad_accum = math.ceil(total_batch_size / (device_batch * max_seq_len))
         schedule.append({
             'new_layers':        list(new_layers),
             'active_layers':     list(active),
@@ -562,13 +562,13 @@ def calibrate_batch_sizes(schedule, raw_model, autocast_ctx, seq_len, total_batc
     Temporarily enables each stage's active layers on raw_model; restores all-disabled on return.
     Returns list of int batch sizes, one per stage.
     """
-    max_divisor = total_batch_size // seq_len
+    max_batch = total_batch_size // seq_len
     valid_batches = sorted(
-        [b for b in range(1, max_divisor + 1) if max_divisor % b == 0 and (b % 16 == 0 or b <= 16)],
+        [b for b in range(16, max_batch + 1, 16)],
         reverse=True,
     )
     if not valid_batches:
-        valid_batches = [max(b for b in range(1, max_divisor + 1) if max_divisor % b == 0)]
+        valid_batches = [max_batch] if max_batch > 0 else [1]
 
     device = next(raw_model.parameters()).device
     total_vram = torch.cuda.get_device_properties(device).total_memory / 1e9
@@ -631,7 +631,8 @@ def calibrate_batch_sizes(schedule, raw_model, autocast_ctx, seq_len, total_batc
         avg_dt = sum(t_times[2:]) / len(t_times[2:])
         tok_per_sec = found_batch * seq_len / avg_dt
         mfu = 100 * num_flops * tok_per_sec / GPU_BF16_PEAK_FLOPS
-        grad_accum = total_batch_size // (found_batch * seq_len)
+        tokens_per_micro = found_batch * seq_len
+        grad_accum = math.ceil(total_batch_size / tokens_per_micro)
         print(f"    → batch={found_batch} grad_accum={grad_accum} "
               f"tok/sec={tok_per_sec:,.0f} MFU≈{mfu:.1f}% dt={avg_dt*1000:.0f}ms")
         calibrated.append(found_batch)
@@ -780,7 +781,7 @@ if not STAGE_BATCH_SIZES:
     # Update schedule in-place with calibrated sizes
     for s, bs in zip(stacked_schedule, calibrated):
         s['device_batch_size'] = bs
-        s['grad_accum_steps'] = TOTAL_BATCH_SIZE // (bs * MAX_SEQ_LEN)
+        s['grad_accum_steps'] = math.ceil(TOTAL_BATCH_SIZE / (bs * MAX_SEQ_LEN))
     # Persist to stage_batch_sizes.py so future runs skip calibration
     _path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stage_batch_sizes.py")
     with open(_path, 'w') as _f:
