@@ -811,7 +811,7 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM); used as initial heuristic
 N_TOP_LAYERS = 2         # top N layers always live; bottom layers added one per stage
 LAYERS_PER_STAGE = 1     # how many bottom layers to add per stage
-FREEZE_AFTER_STAGES = 2  # freeze a layer after it's been trainable for this many stages; top layers never freeze
+FREEZE_AFTER_STAGES = 999  # freeze a layer after it's been trainable for this many stages; top layers never freeze
 STAGE_BATCH_SIZES: list[int] = []  # calibrated per-stage batch sizes; empty = try import, then calibrate
 if not STAGE_BATCH_SIZES:
     try:
