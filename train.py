@@ -5,6 +5,7 @@ Usage: uv run train.py
 """
 
 import os
+import sys
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
@@ -828,18 +829,17 @@ stacked_schedule = build_stacked_schedule(
 )
 
 if not STAGE_BATCH_SIZES:
-    print("STAGE_BATCH_SIZES not set — calibrating per-stage batch sizes...")
+    print("\n" + "="*70)
+    print("WARNING: No STAGE_BATCH_SIZES found. Running calibration...")
+    print("="*70)
     calibrated = calibrate_batch_sizes(
         stacked_schedule, model, optimizer, autocast_ctx, MAX_SEQ_LEN, TOTAL_BATCH_SIZE)
-    # Update schedule in-place with calibrated sizes
-    for s, bs in zip(stacked_schedule, calibrated):
-        s['device_batch_size'] = bs
-        s['grad_accum_steps'] = math.ceil(TOTAL_BATCH_SIZE / (bs * MAX_SEQ_LEN))
-    # Persist to stage_batch_sizes.py so future runs skip calibration
     _path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stage_batch_sizes.py")
     with open(_path, 'w') as _f:
         _f.write(f"STAGE_BATCH_SIZES: list[int] = {calibrated}\n")
-    print(f"Saved STAGE_BATCH_SIZES = {calibrated} to {_path}")
+    print(f"\nSaved to {_path}")
+    print("Run train.py again to start training.")
+    sys.exit(0)
 
 print(f"Stacked training: {len(stacked_schedule)} stages, "
       f"token budget per stage: {stacked_schedule[0]['token_budget']/1e6:.0f}M")
