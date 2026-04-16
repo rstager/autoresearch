@@ -672,10 +672,16 @@ def _move_layer_to(raw_model, optimizer, layer_idx, target_device):
 
 
 def _offload_inactive_layers(raw_model, optimizer):
-    """Move all inactive layers to CPU. Call after model init but before training."""
+    """Move all inactive layers to CPU and mark their optimizer groups inactive."""
+    inactive_layers = set()
     for layer_idx, bc in enumerate(raw_model.block_configs):
         if not bc.enabled:
             _move_layer_to(raw_model, optimizer, layer_idx, torch.device("cpu"))
+            inactive_layers.add(layer_idx)
+    # Mark optimizer groups for inactive layers as inactive
+    for group in optimizer.param_groups:
+        if group.get('kind') == 'muon' and group.get('layer_idx') in inactive_layers:
+            group['active'] = False
     torch.cuda.empty_cache()
     vram_used = torch.cuda.memory_allocated() / 1e9
     print(f"Offloaded inactive layers to CPU. GPU memory: {vram_used:.1f} GB")
