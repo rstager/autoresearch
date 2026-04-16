@@ -1078,6 +1078,8 @@ while True:
             "train/stage": current_stage,
             "train/active_layers": len(stacked_schedule[current_stage]['active_layers']),
             "train/device_batch_size": DEVICE_BATCH_SIZE,
+            "train/wall_training_seconds": (time.time() - t_first_token) if t_first_token else 0,
+            "train/training_seconds": total_training_time,
         }, step=step)
 
     # GC management (Python's GC causes ~500ms stalls)
