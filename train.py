@@ -308,57 +308,41 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    @staticmethod
-    @torch.compile(dynamic=True)
-    def _embed(wte, wte_pad, cos, sin, idx):
+    def forward(self, idx, targets=None, reduction='mean'):
         B, T = idx.size()
-        cos_sin = cos[:, :T], sin[:, :T]
-        x = wte(idx)
-        if wte_pad is not None:
-            pad = wte_pad.expand(B, T, -1)
+        assert T <= self.cos.size(1)
+        cos_sin = self.cos[:, :T], self.sin[:, :T]
+
+        x = self.transformer.wte(idx)
+        if self.wte_pad is not None:
+            pad = self.wte_pad.expand(B, T, -1)
             x = torch.cat([x, pad], dim=-1)
         x = norm(x)
-        return x, cos_sin
-
-    @staticmethod
-    @torch.compile(dynamic=True)
-    def _block_step(block, resid_lambda, x0_lambda, ve_embed, idx, x, x0, cos_sin, window_size, n_embd, n_in):
-        x = resid_lambda * x + x0_lambda * x0
-        ve = ve_embed(idx) if ve_embed is not None else None
-        x_narrow = x[:, :, :n_embd]
-        x_wide = x[:, :, :n_in]
-        out = block(x_narrow, x_wide, ve, cos_sin, window_size)
-        x = torch.cat([out, x[:, :, n_embd:]], dim=-1)
-        return x
-
-    @staticmethod
-    @torch.compile(dynamic=True)
-    def _head(lm_head, x, targets, n_embd_last):
-        x = norm(x)
-        logits = lm_head(x[:, :, :n_embd_last])
-        logits = logits.float()
-        logits = 15 * torch.tanh(logits / 15)
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-        return loss
-
-    def forward(self, idx, targets=None, reduction='mean'):
-        x, cos_sin = self._embed(self.transformer.wte, self.wte_pad, self.cos, self.sin, idx)
         x0 = x
         for i, block in enumerate(self.transformer.h):
             bc = self.block_configs[i]
             if not bc.enabled:
                 continue
-            n_in = bc.n_in if bc.n_in is not None else bc.n_embd
-            ve_embed = self.value_embeds[str(i)] if str(i) in self.value_embeds else None
-            x = self._block_step(block, self.resid_lambdas[i], self.x0_lambdas[i],
-                                 ve_embed, idx, x, x0, cos_sin, self.window_sizes[i],
-                                 bc.n_embd, n_in)
-        if targets is not None:
-            return self._head(self.lm_head, x, targets, self.block_configs[-1].n_embd)
+            n_embd = bc.n_embd
+            n_in = bc.n_in if bc.n_in is not None else n_embd
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+            x_narrow = x[:, :, :n_embd]
+            x_wide = x[:, :, :n_in]
+            out = block(x_narrow, x_wide, ve, cos_sin, self.window_sizes[i])
+            x = torch.cat([out, x[:, :, n_embd:]], dim=-1)
         x = norm(x)
+
+        softcap = 15
         n_embd_last = self.block_configs[-1].n_embd
-        logits = self.lm_head(x[:, :, :n_embd_last]).float()
-        logits = 15 * torch.tanh(logits / 15)
+        logits = self.lm_head(x[:, :, :n_embd_last])
+        logits = logits.float()
+        logits = softcap * torch.tanh(logits / softcap)
+
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
+                                   ignore_index=-1, reduction=reduction)
+            return loss
         return logits
 
 # ---------------------------------------------------------------------------
@@ -887,10 +871,15 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-# Start with all layers disabled and offloaded to CPU — activate_stage will move them to GPU
+# Start with all layers disabled — activate_stage will enable them per-stage
 for bc in model.block_configs:
     bc.enabled = False
-_offload_inactive_layers(model, optimizer)
+# Skip offloading for this test — all layers stay on GPU
+# _offload_inactive_layers(model, optimizer)
+# Still need to mark optimizer groups inactive for disabled layers
+for group in optimizer.param_groups:
+    if group.get('kind') == 'muon':
+        group['active'] = False
 
 # Build stacked schedule; batch sizes come from STAGE_BATCH_SIZES if calibrated, else heuristic
 stacked_schedule = build_stacked_schedule(
@@ -927,36 +916,14 @@ for i, s in enumerate(stacked_schedule):
 
 current_stage = 0
 
-# Warmup: enable ALL layers, run dummy forward+backward to trigger compilation
-# of _embed, _block_step (for all ve/no-ve variants), and _head.
-# This ensures no compilation happens mid-training when new layers activate.
-print("Compile warmup (all layers)...", flush=True)
-_t_compile = time.time()
-for bc in model.block_configs:
-    bc.enabled = True
-for layer_idx in range(len(model.block_configs)):
-    _move_layer_to(model, optimizer, layer_idx, device)
-_warmup_x = torch.randint(0, model.config.vocab_size, (1, MAX_SEQ_LEN), device=device)
-_warmup_y = torch.randint(0, model.config.vocab_size, (1, MAX_SEQ_LEN), device=device)
-with autocast_ctx:
-    _warmup_loss = model(_warmup_x, _warmup_y)
-_warmup_loss.backward()
-model.zero_grad(set_to_none=True)
-del _warmup_x, _warmup_y, _warmup_loss
-# Restore: disable all, offload, then re-activate stage 0
-for bc in model.block_configs:
-    bc.enabled = False
-_offload_inactive_layers(model, optimizer)
-torch.cuda.empty_cache()
-print(f"Compile warmup done in {time.time() - _t_compile:.1f}s", flush=True)
-
-# Re-activate stage 0 for training
+# Activate stage 0, then compile the whole model
 train_loader, DEVICE_BATCH_SIZE, grad_accum_steps = activate_stage(
     0, stacked_schedule, model, optimizer, tokenizer)
+model = torch.compile(model, dynamic=True)
 
 x, y, epoch = next(train_loader)  # prefetch first batch
 
-num_flops_per_token = model.estimate_flops()
+num_flops_per_token = model._orig_mod.estimate_flops()
 print(f"Estimated FLOPs per token (stage 0): {num_flops_per_token:e}")
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
@@ -1101,8 +1068,8 @@ while True:
         tokens_in_stage = 0
         current_stage += 1
         train_loader, DEVICE_BATCH_SIZE, grad_accum_steps = activate_stage(
-            current_stage, stacked_schedule, model, optimizer, tokenizer)
-        num_flops_per_token = model.estimate_flops()
+            current_stage, stacked_schedule, model._orig_mod, optimizer, tokenizer)
+        num_flops_per_token = model._orig_mod.estimate_flops()
         x, y, epoch = next(train_loader)  # prefetch with new loader
 
     # Token budget exhausted — only stop after warmup steps
@@ -1154,7 +1121,7 @@ ckpt_dir = "/data/checkpoints"
 os.makedirs(ckpt_dir, exist_ok=True)
 ckpt_path = os.path.join(ckpt_dir, f"checkpoint_{datetime.now().strftime('%Y%m%d_%H%M%S')}_step{step:05d}.pt")
 torch.save({
-    "model": model.state_dict(),
+    "model": model._orig_mod.state_dict(),
     "config": asdict(config),
     "step": step,
     "val_bpb": val_bpb,
