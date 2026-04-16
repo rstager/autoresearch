@@ -722,6 +722,7 @@ def activate_stage(stage_idx, schedule, raw_model, optimizer, tokenizer):
     Moves newly active layers (and their optimizer state) from CPU to GPU.
     Muon momentum state is NOT reset — it carries forward across stages.
     """
+    t_start = time.time()
     s = schedule[stage_idx]
     new_layer_set = set(s['new_layers'])
     n_layer = len(raw_model.block_configs)
@@ -729,6 +730,7 @@ def activate_stage(stage_idx, schedule, raw_model, optimizer, tokenizer):
     top_layers = set(range(n_layer - N_TOP_LAYERS, n_layer))
 
     # Freeze layers that have been trainable long enough (skip top layers)
+    t0 = time.time()
     for layer_idx in range(n_layer):
         if layer_idx in top_layers:
             continue
@@ -736,32 +738,41 @@ def activate_stage(stage_idx, schedule, raw_model, optimizer, tokenizer):
             continue
         stages_active = stage_idx - _layer_activated_at[layer_idx]
         if stages_active >= FREEZE_AFTER_STAGES and raw_model.block_configs[layer_idx].enabled:
-            bc = raw_model.block_configs[layer_idx]
-            # Check layer still has grad (not already frozen)
             if any(p.requires_grad for p in raw_model.transformer.h[layer_idx].parameters()):
                 _freeze_layer(raw_model, optimizer, layer_idx)
+    t_freeze = time.time() - t0
 
     # Move new layers to GPU, enable them, and mark optimizer groups active
+    t0 = time.time()
     for layer_idx in s['new_layers']:
         _move_layer_to(raw_model, optimizer, layer_idx, device)
         raw_model.block_configs[layer_idx].enabled = True
         _layer_activated_at[layer_idx] = stage_idx
-
     for group in optimizer.param_groups:
         if group.get('kind') == 'muon' and group.get('layer_idx') in new_layer_set:
             group['active'] = True
+    t_move = time.time() - t0
 
+    t0 = time.time()
     torch.cuda.empty_cache()
+    t_cache = time.time() - t0
+
+    t0 = time.time()
+    train_loader = make_dataloader(tokenizer, s['device_batch_size'], MAX_SEQ_LEN, "train")
+    t_loader = time.time() - t0
+
     vram_used = torch.cuda.memory_allocated() / 1e9
     trainable = [i for i in range(n_layer) if raw_model.block_configs[i].enabled
                  and any(p.requires_grad for p in raw_model.transformer.h[i].parameters())]
     frozen = [i for i in range(n_layer) if raw_model.block_configs[i].enabled
               and not any(p.requires_grad for p in raw_model.transformer.h[i].parameters())]
-    train_loader = make_dataloader(tokenizer, s['device_batch_size'], MAX_SEQ_LEN, "train")
+    t_total = time.time() - t_start
     print(f"\n[Stage {stage_idx}] new={s['new_layers']}, "
           f"trainable={trainable}, frozen={frozen}, "
           f"batch={s['device_batch_size']}, grad_accum={s['grad_accum_steps']}, "
           f"GPU mem={vram_used:.1f} GB")
+    print(f"  timing: freeze={t_freeze:.2f}s move={t_move:.2f}s "
+          f"cache={t_cache:.2f}s loader={t_loader:.2f}s total={t_total:.2f}s")
     return train_loader, s['device_batch_size'], s['grad_accum_steps']
 
 
