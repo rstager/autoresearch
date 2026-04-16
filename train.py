@@ -632,6 +632,7 @@ def calibrate_batch_sizes(schedule, raw_model, optimizer, autocast_ctx, seq_len,
             t_times.append(time.time() - t0)
             raw_model.zero_grad(set_to_none=True)
             del x, y, loss
+            torch.cuda.empty_cache()
 
         avg_dt = sum(t_times[2:]) / len(t_times[2:])
         tok_per_sec = found_batch * seq_len / avg_dt
