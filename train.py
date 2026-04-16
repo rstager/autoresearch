@@ -934,8 +934,8 @@ for bc in model.block_configs:
     bc.enabled = True
 for layer_idx in range(len(model.block_configs)):
     _move_layer_to(model, optimizer, layer_idx, device)
-_warmup_x = torch.randint(0, model.config.vocab_size, (DEVICE_BATCH_SIZE, MAX_SEQ_LEN), device=device)
-_warmup_y = torch.randint(0, model.config.vocab_size, (DEVICE_BATCH_SIZE, MAX_SEQ_LEN), device=device)
+_warmup_x = torch.randint(0, model.config.vocab_size, (1, MAX_SEQ_LEN), device=device)
+_warmup_y = torch.randint(0, model.config.vocab_size, (1, MAX_SEQ_LEN), device=device)
 with autocast_ctx:
     _warmup_loss = model(_warmup_x, _warmup_y)
 _warmup_loss.backward()
