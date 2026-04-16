@@ -908,8 +908,10 @@ if not STAGE_BATCH_SIZES:
     print("\n" + "="*70)
     print("WARNING: No STAGE_BATCH_SIZES found. Running calibration...")
     print("="*70)
-    calibrated = calibrate_batch_sizes(
-        stacked_schedule, model, optimizer, autocast_ctx, MAX_SEQ_LEN, TOTAL_BATCH_SIZE)
+    # Disable torch.compile during calibration to avoid inductor OOM on large batch probes
+    with torch._dynamo.config.patch(disable=True):
+        calibrated = calibrate_batch_sizes(
+            stacked_schedule, model, optimizer, autocast_ctx, MAX_SEQ_LEN, TOTAL_BATCH_SIZE)
     _path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stage_batch_sizes.py")
     with open(_path, 'w') as _f:
         _f.write(f"STAGE_BATCH_SIZES: list[int] = {calibrated}\n")
