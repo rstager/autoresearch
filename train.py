@@ -871,15 +871,10 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-# Start with all layers disabled — activate_stage will enable them per-stage
+# Start with all layers disabled and offloaded to CPU
 for bc in model.block_configs:
     bc.enabled = False
-# Skip offloading for this test — all layers stay on GPU
-# _offload_inactive_layers(model, optimizer)
-# Still need to mark optimizer groups inactive for disabled layers
-for group in optimizer.param_groups:
-    if group.get('kind') == 'muon':
-        group['active'] = False
+_offload_inactive_layers(model, optimizer)
 
 # Build stacked schedule; batch sizes come from STAGE_BATCH_SIZES if calibrated, else heuristic
 stacked_schedule = build_stacked_schedule(
