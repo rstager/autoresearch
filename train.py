@@ -349,7 +349,7 @@ class GPT(nn.Module):
             if not bc.enabled:
                 continue
             n_in = bc.n_in if bc.n_in is not None else bc.n_embd
-            ve_embed = self.value_embeds.get(str(i))
+            ve_embed = self.value_embeds[str(i)] if str(i) in self.value_embeds else None
             x = self._block_step(block, self.resid_lambdas[i], self.x0_lambdas[i],
                                  ve_embed, idx, x, x0, cos_sin, self.window_sizes[i],
                                  bc.n_embd, n_in)
