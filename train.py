@@ -672,6 +672,28 @@ def _move_layer_to(raw_model, optimizer, layer_idx, target_device):
                     optimizer.state[p][k] = v.to(target_device)
 
 
+def _freeze_layer(raw_model, optimizer, layer_idx):
+    """Freeze a layer: disable gradients and delete optimizer state. Layer stays on GPU for inference."""
+    block = raw_model.transformer.h[layer_idx]
+    for p in block.parameters():
+        p.requires_grad_(False)
+    ve_key = str(layer_idx)
+    if ve_key in raw_model.value_embeds:
+        for p in raw_model.value_embeds[ve_key].parameters():
+            p.requires_grad_(False)
+    # Delete optimizer state and mark groups inactive
+    for group in optimizer.param_groups:
+        if group.get('layer_idx') != layer_idx:
+            continue
+        group['active'] = False
+        for p in group['params']:
+            if p in optimizer.state:
+                del optimizer.state[p]
+    torch.cuda.empty_cache()
+    vram_used = torch.cuda.memory_allocated() / 1e9
+    print(f"  Froze layer {layer_idx} — no grad, optimizer state deleted, GPU mem={vram_used:.1f} GB")
+
+
 def _offload_inactive_layers(raw_model, optimizer):
     """Move all inactive layers to CPU and mark their optimizer groups inactive."""
     inactive_layers = set()
@@ -688,22 +710,42 @@ def _offload_inactive_layers(raw_model, optimizer):
     print(f"Offloaded inactive layers to CPU. GPU memory: {vram_used:.1f} GB")
 
 
+_layer_activated_at: dict[int, int] = {}  # layer_idx -> stage_idx when first activated
+
+
 def activate_stage(stage_idx, schedule, raw_model, optimizer, tokenizer):
     """
     Enable new layers for this stage, mark their Muon groups active, and
     return a fresh dataloader with the updated batch size.
 
+    Freezes layers that have been trainable for FREEZE_AFTER_STAGES stages.
     Moves newly active layers (and their optimizer state) from CPU to GPU.
     Muon momentum state is NOT reset — it carries forward across stages.
     """
     s = schedule[stage_idx]
     new_layer_set = set(s['new_layers'])
+    n_layer = len(raw_model.block_configs)
     device = next(p for p in raw_model.lm_head.parameters()).device
+    top_layers = set(range(n_layer - N_TOP_LAYERS, n_layer))
+
+    # Freeze layers that have been trainable long enough (skip top layers)
+    for layer_idx in range(n_layer):
+        if layer_idx in top_layers:
+            continue
+        if layer_idx not in _layer_activated_at:
+            continue
+        stages_active = stage_idx - _layer_activated_at[layer_idx]
+        if stages_active >= FREEZE_AFTER_STAGES and raw_model.block_configs[layer_idx].enabled:
+            bc = raw_model.block_configs[layer_idx]
+            # Check layer still has grad (not already frozen)
+            if any(p.requires_grad for p in raw_model.transformer.h[layer_idx].parameters()):
+                _freeze_layer(raw_model, optimizer, layer_idx)
 
     # Move new layers to GPU, enable them, and mark optimizer groups active
     for layer_idx in s['new_layers']:
         _move_layer_to(raw_model, optimizer, layer_idx, device)
         raw_model.block_configs[layer_idx].enabled = True
+        _layer_activated_at[layer_idx] = stage_idx
 
     for group in optimizer.param_groups:
         if group.get('kind') == 'muon' and group.get('layer_idx') in new_layer_set:
@@ -711,9 +753,13 @@ def activate_stage(stage_idx, schedule, raw_model, optimizer, tokenizer):
 
     torch.cuda.empty_cache()
     vram_used = torch.cuda.memory_allocated() / 1e9
+    trainable = [i for i in range(n_layer) if raw_model.block_configs[i].enabled
+                 and any(p.requires_grad for p in raw_model.transformer.h[i].parameters())]
+    frozen = [i for i in range(n_layer) if raw_model.block_configs[i].enabled
+              and not any(p.requires_grad for p in raw_model.transformer.h[i].parameters())]
     train_loader = make_dataloader(tokenizer, s['device_batch_size'], MAX_SEQ_LEN, "train")
-    print(f"\n[Stage {stage_idx}] Enabled layers {s['new_layers']}, "
-          f"active={s['active_layers']}, "
+    print(f"\n[Stage {stage_idx}] new={s['new_layers']}, "
+          f"trainable={trainable}, frozen={frozen}, "
           f"batch={s['device_batch_size']}, grad_accum={s['grad_accum_steps']}, "
           f"GPU mem={vram_used:.1f} GB")
     return train_loader, s['device_batch_size'], s['grad_accum_steps']
@@ -737,6 +783,7 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM); used as initial heuristic
 N_TOP_LAYERS = 2         # top N layers always live; bottom layers added one per stage
+FREEZE_AFTER_STAGES = 2  # freeze a layer after it's been trainable for this many stages; top layers never freeze
 STAGE_BATCH_SIZES: list[int] = []  # calibrated per-stage batch sizes; empty = try import, then calibrate
 if not STAGE_BATCH_SIZES:
     try:
