@@ -133,17 +133,23 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, ve_embed=None):
         super().__init__()
+        self.n_embd = config.n_embd
+        self.n_in = config.n_in if config.n_in is not None else config.n_embd
+        self.window_size = config.window_size
+        self.ve_embed = ve_embed  # nn.Embedding or None
         self.attn = CausalSelfAttention(config)
         self.mlp = MLP(config)
 
-    def forward(self, x, x_wide, ve, cos_sin, window_size):
-        # x      is [B, T, n_embd] — residual stream for this block
-        # x_wide is [B, T, n_in]   — wider context for attn (equals x when n_in == n_embd)
-        x = x + self.attn(norm(x_wide), ve, cos_sin, window_size)
-        x = x + self.mlp(norm(x))
-        return x
+    def forward(self, x, x0, idx, resid_lambda, x0_lambda, cos_sin):
+        x = resid_lambda * x + x0_lambda * x0
+        ve = self.ve_embed(idx) if self.ve_embed is not None else None
+        x_narrow = x[:, :, :self.n_embd]
+        x_wide = x[:, :, :self.n_in]
+        out = x_narrow + self.attn(norm(x_wide), ve, cos_sin, self.window_size)
+        out = out + self.mlp(norm(out))
+        return torch.cat([out, x[:, :, self.n_embd:]], dim=-1)
 
 
 class GPT(nn.Module):
@@ -151,24 +157,21 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
         self.block_configs = [deepcopy(bc) for bc in config.blocks]
-        self.window_sizes = [bc.window_size for bc in self.block_configs]
         bc0 = self.block_configs[0]
         bc_last = self.block_configs[-1]
         head_dim = max(bc.n_embd // bc.n_head for bc in self.block_configs)
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(config.vocab_size, bc0.n_embd),
-            "h": nn.ModuleList([Block(bc) for bc in self.block_configs]),
+            "h": nn.ModuleList([
+                Block(bc, ve_embed=nn.Embedding(config.vocab_size, bc.n_kv_head * (bc.n_embd // bc.n_head)) if bc.has_ve else None)
+                for bc in self.block_configs
+            ]),
         })
         pad_size = config.n_model - bc0.n_embd
         self.wte_pad = nn.Parameter(torch.zeros(pad_size)) if pad_size > 0 else None
         self.lm_head = nn.Linear(bc_last.n_embd, config.vocab_size, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
-        # Value embeddings (kv_dim is per-block)
-        self.value_embeds = nn.ModuleDict({
-            str(i): nn.Embedding(config.vocab_size, bc.n_kv_head * (bc.n_embd // bc.n_head))
-            for i, bc in enumerate(self.block_configs) if bc.has_ve
-        })
         # Rotary embeddings
         self.rotary_seq_len = config.sequence_len * 10
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
@@ -192,11 +195,10 @@ class GPT(nn.Module):
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
-        # Value embeddings
-        for ve in self.value_embeds.values():
-            torch.nn.init.uniform_(ve.weight, -s, s)
-        # Gate weights init to zero (sigmoid(0)=0.5, scaled by 2 -> 1.0 = neutral)
+        # Value embeddings and gate weights
         for block in self.transformer.h:
+            if block.ve_embed is not None:
+                torch.nn.init.uniform_(block.ve_embed.weight, -s, s)
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
         # Rotary embeddings
@@ -205,8 +207,9 @@ class GPT(nn.Module):
         self.cos, self.sin = cos, sin
         # Cast embeddings to bf16
         self.transformer.wte.to(dtype=torch.bfloat16)
-        for ve in self.value_embeds.values():
-            ve.to(dtype=torch.bfloat16)
+        for block in self.transformer.h:
+            if block.ve_embed is not None:
+                block.ve_embed.to(dtype=torch.bfloat16)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         if device is None:
@@ -231,12 +234,12 @@ class GPT(nn.Module):
         lm_head_params = sum(p.numel() for p in self.lm_head.parameters())
         t = self.config.sequence_len
         attn_flops = 0
-        for bc, window_size in zip(self.block_configs, self.window_sizes):
+        for i, bc in enumerate(self.block_configs):
             if not bc.enabled:
                 continue
             h = bc.n_head
             q = bc.n_embd // bc.n_head
-            window = window_size[0]
+            window = self.transformer.h[i].window_size[0]
             effective_seq = t if window < 0 else min(window, t)
             attn_flops += 12 * h * q * effective_seq
         return 6 * (lm_head_params + enabled_block_params) + attn_flops
@@ -250,17 +253,29 @@ class GPT(nn.Module):
                 p.numel()
                 for i, block in enumerate(self.transformer.h)
                 if self.block_configs[i].enabled
-                for p in block.parameters()
+                for p in block.attn.parameters()
+            ) + sum(
+                p.numel()
+                for i, block in enumerate(self.transformer.h)
+                if self.block_configs[i].enabled
+                for p in block.mlp.parameters()
             )
             value_embeds = sum(
                 p.numel()
-                for k, ve in self.value_embeds.items()
-                if self.block_configs[int(k)].enabled
-                for p in ve.parameters()
+                for i, block in enumerate(self.transformer.h)
+                if self.block_configs[i].enabled and block.ve_embed is not None
+                for p in block.ve_embed.parameters()
             )
         else:
-            transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-            value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
+            transformer_matrices = sum(
+                p.numel() for block in self.transformer.h
+                for p in list(block.attn.parameters()) + list(block.mlp.parameters())
+            )
+            value_embeds = sum(
+                p.numel() for block in self.transformer.h
+                if block.ve_embed is not None
+                for p in block.ve_embed.parameters()
+            )
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
         return {
             'wte': wte, 'value_embeds': value_embeds, 'lm_head': lm_head,
@@ -270,7 +285,7 @@ class GPT(nn.Module):
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
                         weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.block_configs[0].n_embd
-        value_embeds_params = list(self.value_embeds.parameters())
+        value_embeds_params = [p for block in self.transformer.h if block.ve_embed is not None for p in block.ve_embed.parameters()]
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
@@ -320,17 +335,9 @@ class GPT(nn.Module):
         x = norm(x)
         x0 = x
         for i, block in enumerate(self.transformer.h):
-            bc = self.block_configs[i]
-            if not bc.enabled:
+            if not self.block_configs[i].enabled:
                 continue
-            n_embd = bc.n_embd
-            n_in = bc.n_in if bc.n_in is not None else n_embd
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x_narrow = x[:, :, :n_embd]
-            x_wide = x[:, :, :n_in]
-            out = block(x_narrow, x_wide, ve, cos_sin, self.window_sizes[i])
-            x = torch.cat([out, x[:, :, n_embd:]], dim=-1)
+            x = block(x, x0, idx, self.resid_lambdas[i], self.x0_lambdas[i], cos_sin)
         x = norm(x)
 
         softcap = 15
@@ -654,12 +661,9 @@ def calibrate_batch_sizes(schedule, raw_model, optimizer, autocast_ctx, seq_len,
 
 
 def _move_layer_to(raw_model, optimizer, layer_idx, target_device):
-    """Move a transformer layer, its value embeddings, and optimizer state to target_device."""
+    """Move a transformer layer (including its value embeddings) and optimizer state to target_device."""
     block = raw_model.transformer.h[layer_idx]
     block.to(target_device)
-    ve_key = str(layer_idx)
-    if ve_key in raw_model.value_embeds:
-        raw_model.value_embeds[ve_key].to(target_device)
     # Move optimizer state for this layer's param groups
     for group in optimizer.param_groups:
         if group.get('layer_idx') != layer_idx:
@@ -677,10 +681,6 @@ def _freeze_layer(raw_model, optimizer, layer_idx):
     block = raw_model.transformer.h[layer_idx]
     for p in block.parameters():
         p.requires_grad_(False)
-    ve_key = str(layer_idx)
-    if ve_key in raw_model.value_embeds:
-        for p in raw_model.value_embeds[ve_key].parameters():
-            p.requires_grad_(False)
     # Delete optimizer state and mark groups inactive
     for group in optimizer.param_groups:
         if group.get('layer_idx') != layer_idx:
@@ -911,14 +911,37 @@ for i, s in enumerate(stacked_schedule):
 
 current_stage = 0
 
-# Activate stage 0, then compile the whole model
+# Compile each Block, then warmup with all layers enabled to trigger compilation
+print("Compiling blocks...", flush=True)
+_t_compile = time.time()
+for i in range(len(model.transformer.h)):
+    model.transformer.h[i] = torch.compile(model.transformer.h[i], dynamic=True)
+# Warmup: enable all layers, dummy forward+backward (batch=1) to pre-compile all variants
+for bc in model.block_configs:
+    bc.enabled = True
+for layer_idx in range(len(model.block_configs)):
+    _move_layer_to(model, optimizer, layer_idx, device)
+_wx = torch.randint(0, model.config.vocab_size, (1, MAX_SEQ_LEN), device=device)
+_wy = torch.randint(0, model.config.vocab_size, (1, MAX_SEQ_LEN), device=device)
+with autocast_ctx:
+    _wl = model(_wx, _wy)
+_wl.backward()
+model.zero_grad(set_to_none=True)
+del _wx, _wy, _wl
+# Restore: disable all, offload
+for bc in model.block_configs:
+    bc.enabled = False
+_offload_inactive_layers(model, optimizer)
+torch.cuda.empty_cache()
+print(f"Compile warmup done in {time.time() - _t_compile:.1f}s", flush=True)
+
+# Activate stage 0 for training
 train_loader, DEVICE_BATCH_SIZE, grad_accum_steps = activate_stage(
     0, stacked_schedule, model, optimizer, tokenizer)
-model = torch.compile(model, dynamic=True)
 
 x, y, epoch = next(train_loader)  # prefetch first batch
 
-num_flops_per_token = model._orig_mod.estimate_flops()
+num_flops_per_token = model.estimate_flops()
 print(f"Estimated FLOPs per token (stage 0): {num_flops_per_token:e}")
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
@@ -1063,8 +1086,8 @@ while True:
         tokens_in_stage = 0
         current_stage += 1
         train_loader, DEVICE_BATCH_SIZE, grad_accum_steps = activate_stage(
-            current_stage, stacked_schedule, model._orig_mod, optimizer, tokenizer)
-        num_flops_per_token = model._orig_mod.estimate_flops()
+            current_stage, stacked_schedule, model, optimizer, tokenizer)
+        num_flops_per_token = model.estimate_flops()
         x, y, epoch = next(train_loader)  # prefetch with new loader
 
     # Token budget exhausted — only stop after warmup steps
@@ -1116,7 +1139,7 @@ ckpt_dir = "/data/checkpoints"
 os.makedirs(ckpt_dir, exist_ok=True)
 ckpt_path = os.path.join(ckpt_dir, f"checkpoint_{datetime.now().strftime('%Y%m%d_%H%M%S')}_step{step:05d}.pt")
 torch.save({
-    "model": model._orig_mod.state_dict(),
+    "model": model.state_dict(),
     "config": asdict(config),
     "step": step,
     "val_bpb": val_bpb,
