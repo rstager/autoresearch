@@ -773,18 +773,6 @@ def activate_stage(stage_idx, schedule, raw_model, optimizer, tokenizer):
     torch.cuda.empty_cache()
     t_cache = time.time() - t0
 
-    # Warmup: dummy forward+backward to trigger compilation for new block shapes
-    t0 = time.time()
-    _wx = torch.randint(0, raw_model.config.vocab_size, (s['device_batch_size'], MAX_SEQ_LEN), device=device)
-    _wy = torch.randint(0, raw_model.config.vocab_size, (s['device_batch_size'], MAX_SEQ_LEN), device=device)
-    with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-        _wl = raw_model(_wx, _wy)
-    _wl.backward()
-    raw_model.zero_grad(set_to_none=True)
-    del _wx, _wy, _wl
-    torch.cuda.empty_cache()
-    t_compile = time.time() - t0
-
     t0 = time.time()
     train_loader = make_dataloader(tokenizer, s['device_batch_size'], MAX_SEQ_LEN, "train")
     t_loader = time.time() - t0
@@ -799,7 +787,7 @@ def activate_stage(stage_idx, schedule, raw_model, optimizer, tokenizer):
           f"trainable={trainable}, frozen={frozen}, "
           f"batch={s['device_batch_size']}, grad_accum={s['grad_accum_steps']}, "
           f"GPU mem={vram_used:.1f} GB")
-    print(f"  timing: freeze={t_freeze:.2f}s move={t_move:.2f}s compile={t_compile:.2f}s "
+    print(f"  timing: freeze={t_freeze:.2f}s move={t_move:.2f}s "
           f"cache={t_cache:.2f}s loader={t_loader:.2f}s total={t_total:.2f}s")
     return train_loader, s['device_batch_size'], s['grad_accum_steps']
 
@@ -936,13 +924,16 @@ for i, s in enumerate(stacked_schedule):
           f"batch={s['device_batch_size']} grad_accum={s['grad_accum_steps']}")
 
 current_stage = 0
-train_loader, DEVICE_BATCH_SIZE, grad_accum_steps = activate_stage(
-    0, stacked_schedule, model, optimizer, tokenizer)
 
-# Warmup: dummy forward+backward to trigger lazy compilation of @torch.compile
-# decorated methods (_embed, _block_step, _head) before training starts.
-print("Compile warmup...", flush=True)
+# Warmup: enable ALL layers, run dummy forward+backward to trigger compilation
+# of _embed, _block_step (for all ve/no-ve variants), and _head.
+# This ensures no compilation happens mid-training when new layers activate.
+print("Compile warmup (all layers)...", flush=True)
 _t_compile = time.time()
+for bc in model.block_configs:
+    bc.enabled = True
+for layer_idx in range(len(model.block_configs)):
+    _move_layer_to(model, optimizer, layer_idx, device)
 _warmup_x = torch.randint(0, model.config.vocab_size, (DEVICE_BATCH_SIZE, MAX_SEQ_LEN), device=device)
 _warmup_y = torch.randint(0, model.config.vocab_size, (DEVICE_BATCH_SIZE, MAX_SEQ_LEN), device=device)
 with autocast_ctx:
@@ -950,8 +941,16 @@ with autocast_ctx:
 _warmup_loss.backward()
 model.zero_grad(set_to_none=True)
 del _warmup_x, _warmup_y, _warmup_loss
+# Restore: disable all, offload, then re-activate stage 0
+for bc in model.block_configs:
+    bc.enabled = False
+_offload_inactive_layers(model, optimizer)
 torch.cuda.empty_cache()
 print(f"Compile warmup done in {time.time() - _t_compile:.1f}s", flush=True)
+
+# Re-activate stage 0 for training
+train_loader, DEVICE_BATCH_SIZE, grad_accum_steps = activate_stage(
+    0, stacked_schedule, model, optimizer, tokenizer)
 
 x, y, epoch = next(train_loader)  # prefetch first batch
 
