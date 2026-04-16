@@ -909,16 +909,13 @@ current_stage = 0
 train_loader, DEVICE_BATCH_SIZE, grad_accum_steps = activate_stage(
     0, stacked_schedule, model, optimizer, tokenizer)
 
-# Compile individual blocks (not the whole model) so that stage transitions
-# (enabling/disabling layers) don't trigger full-model recompilation.
-# The GPT.forward loop stays eager Python; only the heavy block kernels are compiled.
-for block in model.transformer.h:
-    block.attn = torch.compile(block.attn, dynamic=True)
-    block.mlp = torch.compile(block.mlp, dynamic=True)
+# Full-model compile for best throughput (~2x vs per-block compile).
+# Recompiles on stage transitions when enabled layers change (~50s for 50M model).
+model = torch.compile(model, dynamic=True)
 
 x, y, epoch = next(train_loader)  # prefetch first batch
 
-num_flops_per_token = model.estimate_flops()
+num_flops_per_token = model._orig_mod.estimate_flops()
 print(f"Estimated FLOPs per token (stage 0): {num_flops_per_token:e}")
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
@@ -1058,8 +1055,8 @@ while True:
         tokens_in_stage = 0
         current_stage += 1
         train_loader, DEVICE_BATCH_SIZE, grad_accum_steps = activate_stage(
-            current_stage, stacked_schedule, model, optimizer, tokenizer)
-        num_flops_per_token = model.estimate_flops()
+            current_stage, stacked_schedule, model._orig_mod, optimizer, tokenizer)
+        num_flops_per_token = model._orig_mod.estimate_flops()
         x, y, epoch = next(train_loader)  # prefetch with new loader
 
     # Token budget exhausted — only stop after warmup steps
@@ -1108,7 +1105,7 @@ ckpt_dir = "/data/checkpoints"
 os.makedirs(ckpt_dir, exist_ok=True)
 ckpt_path = os.path.join(ckpt_dir, f"checkpoint_{datetime.now().strftime('%Y%m%d_%H%M%S')}_step{step:05d}.pt")
 torch.save({
-    "model": model.state_dict(),
+    "model": model._orig_mod.state_dict(),
     "config": asdict(config),
     "step": step,
     "val_bpb": val_bpb,
