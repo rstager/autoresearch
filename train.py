@@ -308,41 +308,57 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, reduction='mean'):
+    @staticmethod
+    @torch.compile(dynamic=True)
+    def _embed(wte, wte_pad, cos, sin, idx):
         B, T = idx.size()
-        assert T <= self.cos.size(1)
-        cos_sin = self.cos[:, :T], self.sin[:, :T]
-
-        x = self.transformer.wte(idx)          # [B, T, bc0.n_embd]
-        if self.wte_pad is not None:
-            pad = self.wte_pad.expand(B, T, -1)
-            x = torch.cat([x, pad], dim=-1)    # [B, T, n_model]
+        cos_sin = cos[:, :T], sin[:, :T]
+        x = wte(idx)
+        if wte_pad is not None:
+            pad = wte_pad.expand(B, T, -1)
+            x = torch.cat([x, pad], dim=-1)
         x = norm(x)
+        return x, cos_sin
+
+    @staticmethod
+    @torch.compile(dynamic=True)
+    def _block_step(block, resid_lambda, x0_lambda, ve_embed, idx, x, x0, cos_sin, window_size, n_embd, n_in):
+        x = resid_lambda * x + x0_lambda * x0
+        ve = ve_embed(idx) if ve_embed is not None else None
+        x_narrow = x[:, :, :n_embd]
+        x_wide = x[:, :, :n_in]
+        out = block(x_narrow, x_wide, ve, cos_sin, window_size)
+        x = torch.cat([out, x[:, :, n_embd:]], dim=-1)
+        return x
+
+    @staticmethod
+    @torch.compile(dynamic=True)
+    def _head(lm_head, x, targets, n_embd_last):
+        x = norm(x)
+        logits = lm_head(x[:, :, :n_embd_last])
+        logits = logits.float()
+        logits = 15 * torch.tanh(logits / 15)
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        return loss
+
+    def forward(self, idx, targets=None, reduction='mean'):
+        x, cos_sin = self._embed(self.transformer.wte, self.wte_pad, self.cos, self.sin, idx)
         x0 = x
         for i, block in enumerate(self.transformer.h):
             bc = self.block_configs[i]
             if not bc.enabled:
                 continue
-            n_embd = bc.n_embd
-            n_in = bc.n_in if bc.n_in is not None else n_embd
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x_narrow = x[:, :, :n_embd]
-            x_wide = x[:, :, :n_in]
-            out = block(x_narrow, x_wide, ve, cos_sin, self.window_sizes[i])  # [B,T,n_embd]
-            x = torch.cat([out, x[:, :, n_embd:]], dim=-1)
-        x = norm(x)
-
-        softcap = 15
-        n_embd_last = self.block_configs[-1].n_embd
-        logits = self.lm_head(x[:, :, :n_embd_last])
-        logits = logits.float()
-        logits = softcap * torch.tanh(logits / softcap)
-
+            n_in = bc.n_in if bc.n_in is not None else bc.n_embd
+            ve_embed = self.value_embeds.get(str(i))
+            x = self._block_step(block, self.resid_lambdas[i], self.x0_lambdas[i],
+                                 ve_embed, idx, x, x0, cos_sin, self.window_sizes[i],
+                                 bc.n_embd, n_in)
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
-                                   ignore_index=-1, reduction=reduction)
-            return loss
+            return self._head(self.lm_head, x, targets, self.block_configs[-1].n_embd)
+        x = norm(x)
+        n_embd_last = self.block_configs[-1].n_embd
+        logits = self.lm_head(x[:, :, :n_embd_last]).float()
+        logits = 15 * torch.tanh(logits / 15)
         return logits
 
 # ---------------------------------------------------------------------------
@@ -757,12 +773,8 @@ def activate_stage(stage_idx, schedule, raw_model, optimizer, tokenizer):
     torch.cuda.empty_cache()
     t_cache = time.time() - t0
 
-    # Compile and warm up new blocks with dummy forward+backward
+    # Warmup: dummy forward+backward to trigger compilation for new block shapes
     t0 = time.time()
-    for layer_idx in s['new_layers']:
-        block = raw_model.transformer.h[layer_idx]
-        block.attn = torch.compile(block.attn, dynamic=True)
-        block.mlp = torch.compile(block.mlp, dynamic=True)
     _wx = torch.randint(0, raw_model.config.vocab_size, (s['device_batch_size'], MAX_SEQ_LEN), device=device)
     _wy = torch.randint(0, raw_model.config.vocab_size, (s['device_batch_size'], MAX_SEQ_LEN), device=device)
     with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -927,13 +939,10 @@ current_stage = 0
 train_loader, DEVICE_BATCH_SIZE, grad_accum_steps = activate_stage(
     0, stacked_schedule, model, optimizer, tokenizer)
 
-# Compile individual blocks and warm up with dummy forward+backward to trigger
-# lazy compilation now (not during the first training step).
-print("Compiling blocks...", flush=True)
-for i, block in enumerate(model.transformer.h):
-    block.attn = torch.compile(block.attn, dynamic=True)
-    block.mlp = torch.compile(block.mlp, dynamic=True)
-# Warmup: dummy forward+backward through enabled blocks to trigger compilation
+# Warmup: dummy forward+backward to trigger lazy compilation of @torch.compile
+# decorated methods (_embed, _block_step, _head) before training starts.
+print("Compile warmup...", flush=True)
+_t_compile = time.time()
 _warmup_x = torch.randint(0, model.config.vocab_size, (DEVICE_BATCH_SIZE, MAX_SEQ_LEN), device=device)
 _warmup_y = torch.randint(0, model.config.vocab_size, (DEVICE_BATCH_SIZE, MAX_SEQ_LEN), device=device)
 with autocast_ctx:
@@ -942,7 +951,7 @@ _warmup_loss.backward()
 model.zero_grad(set_to_none=True)
 del _warmup_x, _warmup_y, _warmup_loss
 torch.cuda.empty_cache()
-print("Compilation warmup done.", flush=True)
+print(f"Compile warmup done in {time.time() - _t_compile:.1f}s", flush=True)
 
 x, y, epoch = next(train_loader)  # prefetch first batch
 
