@@ -757,6 +757,22 @@ def activate_stage(stage_idx, schedule, raw_model, optimizer, tokenizer):
     torch.cuda.empty_cache()
     t_cache = time.time() - t0
 
+    # Compile and warm up new blocks with dummy forward+backward
+    t0 = time.time()
+    for layer_idx in s['new_layers']:
+        block = raw_model.transformer.h[layer_idx]
+        block.attn = torch.compile(block.attn, dynamic=True)
+        block.mlp = torch.compile(block.mlp, dynamic=True)
+    _wx = torch.randint(0, raw_model.config.vocab_size, (s['device_batch_size'], MAX_SEQ_LEN), device=device)
+    _wy = torch.randint(0, raw_model.config.vocab_size, (s['device_batch_size'], MAX_SEQ_LEN), device=device)
+    with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+        _wl = raw_model(_wx, _wy)
+    _wl.backward()
+    raw_model.zero_grad(set_to_none=True)
+    del _wx, _wy, _wl
+    torch.cuda.empty_cache()
+    t_compile = time.time() - t0
+
     t0 = time.time()
     train_loader = make_dataloader(tokenizer, s['device_batch_size'], MAX_SEQ_LEN, "train")
     t_loader = time.time() - t0
@@ -771,7 +787,7 @@ def activate_stage(stage_idx, schedule, raw_model, optimizer, tokenizer):
           f"trainable={trainable}, frozen={frozen}, "
           f"batch={s['device_batch_size']}, grad_accum={s['grad_accum_steps']}, "
           f"GPU mem={vram_used:.1f} GB")
-    print(f"  timing: freeze={t_freeze:.2f}s move={t_move:.2f}s "
+    print(f"  timing: freeze={t_freeze:.2f}s move={t_move:.2f}s compile={t_compile:.2f}s "
           f"cache={t_cache:.2f}s loader={t_loader:.2f}s total={t_total:.2f}s")
     return train_loader, s['device_batch_size'], s['grad_accum_steps']
 
@@ -911,13 +927,26 @@ current_stage = 0
 train_loader, DEVICE_BATCH_SIZE, grad_accum_steps = activate_stage(
     0, stacked_schedule, model, optimizer, tokenizer)
 
-# Full-model compile for best throughput (~2x vs per-block compile).
-# Recompiles on stage transitions when enabled layers change (~50s for 50M model).
-model = torch.compile(model, dynamic=True)
+# Compile individual blocks and warm up with dummy forward+backward to trigger
+# lazy compilation now (not during the first training step).
+print("Compiling blocks...", flush=True)
+for i, block in enumerate(model.transformer.h):
+    block.attn = torch.compile(block.attn, dynamic=True)
+    block.mlp = torch.compile(block.mlp, dynamic=True)
+# Warmup: dummy forward+backward through enabled blocks to trigger compilation
+_warmup_x = torch.randint(0, model.config.vocab_size, (DEVICE_BATCH_SIZE, MAX_SEQ_LEN), device=device)
+_warmup_y = torch.randint(0, model.config.vocab_size, (DEVICE_BATCH_SIZE, MAX_SEQ_LEN), device=device)
+with autocast_ctx:
+    _warmup_loss = model(_warmup_x, _warmup_y)
+_warmup_loss.backward()
+model.zero_grad(set_to_none=True)
+del _warmup_x, _warmup_y, _warmup_loss
+torch.cuda.empty_cache()
+print("Compilation warmup done.", flush=True)
 
 x, y, epoch = next(train_loader)  # prefetch first batch
 
-num_flops_per_token = model._orig_mod.estimate_flops()
+num_flops_per_token = model.estimate_flops()
 print(f"Estimated FLOPs per token (stage 0): {num_flops_per_token:e}")
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
@@ -970,6 +999,7 @@ def get_weight_decay(progress):
 # ---------------------------------------------------------------------------
 
 t_start_training = time.time()
+t_first_token = None  # set on first real training step (excludes compile warmups)
 smooth_train_loss = 0
 total_training_time = 0
 total_tokens_trained = 0  # tokens seen (excludes warmup steps)
@@ -1012,6 +1042,8 @@ while True:
     dt = t1 - t0
 
     if step > 10:
+        if t_first_token is None:
+            t_first_token = t0
         total_training_time += dt
         total_tokens_trained += TOTAL_BATCH_SIZE
         tokens_in_stage += TOTAL_BATCH_SIZE
@@ -1057,8 +1089,8 @@ while True:
         tokens_in_stage = 0
         current_stage += 1
         train_loader, DEVICE_BATCH_SIZE, grad_accum_steps = activate_stage(
-            current_stage, stacked_schedule, model._orig_mod, optimizer, tokenizer)
-        num_flops_per_token = model._orig_mod.estimate_flops()
+            current_stage, stacked_schedule, model, optimizer, tokenizer)
+        num_flops_per_token = model.estimate_flops()
         x, y, epoch = next(train_loader)  # prefetch with new loader
 
     # Token budget exhausted — only stop after warmup steps
@@ -1077,13 +1109,15 @@ with autocast_ctx:
 # Final summary
 t_end = time.time()
 startup_time = t_start_training - t_start
+wall_training_time = (t_end - t_first_token) if t_first_token else 0
 steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / GPU_BF16_PEAK_FLOPS if total_training_time > 0 else 0
 peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
 print("---")
 print(f"val_bpb:          {val_bpb:.6f}")
-print(f"training_seconds: {total_training_time:.1f}")
-print(f"total_seconds:    {t_end - t_start:.1f}")
+print(f"training_seconds: {total_training_time:.1f} (sum of step dt)")
+print(f"wall_training:    {wall_training_time:.1f} (wall clock from first token)")
+print(f"total_seconds:    {t_end - t_start:.1f} (includes startup + compile)")
 print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
 print(f"mfu_percent:      {steady_state_mfu:.2f}")
 print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
@@ -1099,6 +1133,7 @@ if wandb is not None:
         "eval/total_tokens_M": total_tokens / 1e6,
         "eval/num_steps": step,
         "eval/training_seconds": total_training_time,
+        "eval/wall_training_seconds": wall_training_time,
     })
     wandb.finish()
 
@@ -1107,7 +1142,7 @@ ckpt_dir = "/data/checkpoints"
 os.makedirs(ckpt_dir, exist_ok=True)
 ckpt_path = os.path.join(ckpt_dir, f"checkpoint_{datetime.now().strftime('%Y%m%d_%H%M%S')}_step{step:05d}.pt")
 torch.save({
-    "model": model._orig_mod.state_dict(),
+    "model": model.state_dict(),
     "config": asdict(config),
     "step": step,
     "val_bpb": val_bpb,
