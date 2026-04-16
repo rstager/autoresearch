@@ -489,13 +489,13 @@ class MuonAdamW(torch.optim.Optimizer):
 def build_stacked_schedule(n_layer, total_matrix_params,
                             total_batch_size=2**19, max_seq_len=2048,
                             initial_device_batch=128, n_top=2,
-                            stage_batch_sizes=None):
+                            layers_per_stage=1, stage_batch_sizes=None):
     """
     Build the bottom-up stage schedule for stacked layer training.
 
     The top n_top layers are always live (providing gradient signal to lm_head).
     Stage 0 starts with the first n_top bottom layers + all n_top top layers.
-    Each subsequent stage adds one more bottom layer working inward.
+    Each subsequent stage adds layers_per_stage bottom layers working inward.
 
     Token budget = equal split of 20 * total_matrix_params across all stages.
     Batch size scales down proportionally as more layers are active, keeping
@@ -508,8 +508,8 @@ def build_stacked_schedule(n_layer, total_matrix_params,
     top_layers = list(range(n_layer - n_top, n_layer))
     n_bottom = n_layer - n_top
     stages_new = [list(range(n_top)) + top_layers]  # stage 0: first n_top bottom + all top
-    for i in range(n_top, n_bottom):
-        stages_new.append([i])
+    for i in range(n_top, n_bottom, layers_per_stage):
+        stages_new.append(list(range(i, min(i + layers_per_stage, n_bottom))))
     n_stages = len(stages_new)
 
     # Valid device batch sizes: divisors of total_batch_size // max_seq_len
@@ -794,6 +794,7 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM); used as initial heuristic
 N_TOP_LAYERS = 2         # top N layers always live; bottom layers added one per stage
+LAYERS_PER_STAGE = 2     # how many bottom layers to add per stage (2 = fewer stages, fewer recompiles)
 FREEZE_AFTER_STAGES = 2  # freeze a layer after it's been trainable for this many stages; top layers never freeze
 STAGE_BATCH_SIZES: list[int] = []  # calibrated per-stage batch sizes; empty = try import, then calibrate
 if not STAGE_BATCH_SIZES:
@@ -883,6 +884,7 @@ stacked_schedule = build_stacked_schedule(
     max_seq_len=MAX_SEQ_LEN,
     initial_device_batch=DEVICE_BATCH_SIZE,
     n_top=N_TOP_LAYERS,
+    layers_per_stage=LAYERS_PER_STAGE,
     stage_batch_sizes=STAGE_BATCH_SIZES if STAGE_BATCH_SIZES else None,
 )
 
